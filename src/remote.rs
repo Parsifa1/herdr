@@ -1,7 +1,17 @@
 mod args;
 mod attach;
+#[cfg(all(test, unix))]
+mod benchmark;
+#[cfg(unix)]
+pub(crate) mod frame;
 mod host;
 mod process;
+#[cfg(unix)]
+mod quic;
+#[cfg(unix)]
+mod quic_bridge;
+#[cfg(unix)]
+pub(crate) mod quic_policy;
 mod restart_policy;
 mod saved;
 #[cfg(unix)]
@@ -10,7 +20,16 @@ mod ssh_agent;
 pub(crate) use args::*;
 pub(crate) use attach::*;
 pub(crate) use host::run_remote_client_bridge;
+#[cfg(unix)]
+pub(crate) use host::run_remote_quic_bootstrap;
 pub(crate) use saved::*;
+
+#[cfg(windows)]
+pub(crate) fn run_remote_quic_bootstrap(_logical_client_id: Option<&str>) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "remote Windows hosts are not supported yet",
+    ))
+}
 
 pub(crate) fn run_remote_api_bridge(args: &[String]) -> std::io::Result<()> {
     match args {
@@ -54,44 +73,44 @@ pub(crate) fn print_remote_error_hint(err: &std::io::Error, target: &str) {
             "hint: verify SSH access first with `{}`.",
             ssh_check_command(target)
         );
-        eprintln!(
-            "hint: if your SSH key has a passphrase, load it into ssh-agent with `ssh-add` before running `herdr --remote`."
-        );
     }
 }
 
 fn is_remote_host_key_error(err: &std::io::Error) -> bool {
-    let message = err.to_string().to_ascii_lowercase();
-    message.contains("host key verification failed")
-        || message.contains("remote host identification has changed")
+    let message = err.to_string();
+    message.contains("Host key verification failed")
+        || message.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
 }
 
 fn is_remote_auth_error(err: &std::io::Error) -> bool {
     let message = err.to_string();
     message.contains("Permission denied")
-        && (message.contains("(publickey")
-            || message.contains("(keyboard-interactive")
-            || message.contains("(password"))
 }
 
 fn ssh_check_command(target: &str) -> String {
     format!("ssh {}", shell_quote(target))
 }
 
-fn shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value.chars().all(|ch| {
-            ch.is_ascii_alphanumeric()
-                || matches!(
-                    ch,
-                    '@' | '%' | '_' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
-                )
-        })
+pub(crate) fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-._/:@%+".contains(&b))
     {
         return value.to_string();
     }
-
-    format!("'{}'", value.replace('\'', "'\\''"))
+    let mut escaped = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            escaped.push_str("'\\''");
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped.push('\'');
+    escaped
 }
 
 #[cfg(test)]

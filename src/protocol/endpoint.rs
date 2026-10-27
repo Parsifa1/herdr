@@ -39,6 +39,10 @@ pub struct EndpointAgentCompletions {
     pub completions: std::collections::BTreeMap<String, u64>,
 }
 
+/// Client-local transport state injected by the local QUIC bridge toward the
+/// thin client. Never sent to or by a server.
+pub const TRANSPORT_STATUS_KIND: &str = "endpoint.transport.status.v1";
+
 fn default_true() -> bool {
     true
 }

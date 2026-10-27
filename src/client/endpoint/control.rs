@@ -10,6 +10,8 @@ pub(crate) enum EndpointControlMessage {
     HealthPong,
     AgentViewProjection(DecodedAgentViewProjection),
     AgentCompletions(crate::protocol::endpoint::EndpointAgentCompletions),
+    /// Local bridge hint: the transport path is recovering (`true`) or not.
+    TransportRecovering(bool),
     Snapshot(Box<crate::protocol::ClientShellSnapshot>),
     Ignored,
 }
@@ -20,6 +22,17 @@ pub(crate) fn decode_endpoint_control(
 ) -> Result<EndpointControlMessage, String> {
     if kind == crate::protocol::endpoint::HEALTH_PONG_KIND {
         return Ok(EndpointControlMessage::HealthPong);
+    }
+if kind == crate::protocol::endpoint::TRANSPORT_STATUS_KIND {
+        #[derive(serde::Deserialize)]
+        struct TransportStatus<'a> {
+            state: &'a str,
+        }
+        let status: TransportStatus<'_> = serde_json::from_str(data)
+            .map_err(|error| format!("invalid transport status: {error}"))?;
+        return Ok(EndpointControlMessage::TransportRecovering(
+            status.state == "recovering",
+        ));
     }
     if kind == crate::protocol::endpoint::AGENT_COMPLETIONS_KIND {
         return Ok(serde_json::from_str(data)
@@ -84,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_guard_optional_control_round_trips_without_changing_snapshot_codec() {
+fn completion_guard_optional_control_round_trips_without_changing_snapshot_codec() {
         let projection = crate::protocol::endpoint::EndpointAgentCompletions {
             boot_id: "boot".into(),
             revision: 3,
@@ -162,6 +175,24 @@ mod tests {
             .unwrap(),
             EndpointControlMessage::Ignored
         ));
+    }
+
+    #[test]
+    fn transport_status_reports_only_recovering_as_recovering() {
+        for (state, recovering) in [("recovering", true), ("live", false)] {
+            assert!(matches!(
+                decode_endpoint_control(
+                    crate::protocol::endpoint::TRANSPORT_STATUS_KIND,
+                    &format!(r#"{{"state":"{state}"}}"#),
+                )
+                .unwrap(),
+                EndpointControlMessage::TransportRecovering(value) if value == recovering
+            ));
+        }
+        assert!(
+            decode_endpoint_control(crate::protocol::endpoint::TRANSPORT_STATUS_KIND, "{}")
+                .is_err()
+        );
     }
 
     #[test]

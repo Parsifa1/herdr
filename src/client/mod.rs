@@ -240,7 +240,10 @@ fn run_client_with_mode(
     } else {
         endpoint::EndpointCatalog::default()
     };
-    let federated = endpoint_catalog.has_enabled_ssh();
+    // A `--remote` client's Local is a bridge socket that closes whenever the
+    // remote transport is replaced, so it is supervised like a saved machine:
+    // a lost connection reconnects instead of ending the client.
+    let federated = endpoint_catalog.has_enabled_ssh() || is_remote_client_process();
 
     let initial_stream = match crate::ipc::connect_local_stream(&socket_path) {
         Ok(stream) => Some(stream),
@@ -493,7 +496,7 @@ async fn run_client_loop(
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
     };
-    let mut federated = endpoint_catalog.has_enabled_ssh();
+    let mut federated = endpoint_catalog.has_enabled_ssh() || is_remote_client;
     if let Some(shell) = state.shell.as_mut() {
         shell.set_host_reports_key_releases(config.host_escape_disambiguation_active);
         shell.set_host_erase_byte(crate::platform::terminal_erase_byte());
@@ -2114,7 +2117,7 @@ async fn run_client_loop(
                         }
                         let snapshot = match endpoint::decode_endpoint_control(&kind, &data) {
                             Ok(endpoint::EndpointControlMessage::HealthPong) => continue,
-                            Ok(endpoint::EndpointControlMessage::AgentViewProjection(
+Ok(endpoint::EndpointControlMessage::AgentViewProjection(
                                 projection,
                             )) => {
                                 if let Some(shell) = state.shell.as_mut() {
@@ -2133,6 +2136,15 @@ async fn run_client_loop(
                                         generation,
                                         projection,
                                     );
+                                }
+                                continue;
+                            }
+Ok(endpoint::EndpointControlMessage::TransportRecovering(
+                                recovering,
+                            )) => {
+                                write_stream.set_recovering(&endpoint_id, generation, recovering);
+                                if let Some(shell) = state.shell.as_mut() {
+                                    shell.set_endpoint_roaming(&endpoint_id, recovering);
                                 }
                                 continue;
                             }
@@ -2239,6 +2251,9 @@ async fn run_client_loop(
                     }
                     ServerMessage::Welcome { .. } => {
                         debug!("received unexpected Welcome in main loop");
+                    }
+                    ServerMessage::RemoteBootstrap { .. } => {
+                        debug!("received remote bootstrap response outside a bootstrap helper");
                     }
                 }
             }

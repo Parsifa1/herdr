@@ -7,8 +7,13 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use super::attach::{find_installed_remote_herdr, RemoteSsh, SshStdioBridge};
+#[cfg(unix)]
+use super::quic_bridge::{QuicBridge, QuicBridgeConfig};
 
 pub(crate) struct SavedSshBridge {
+    #[cfg(unix)]
+    _bridge: QuicBridge,
+    #[cfg(not(unix))]
     _bridge: SshStdioBridge,
 }
 
@@ -32,6 +37,20 @@ pub(crate) fn connect_saved_ssh(
         return Err(super::process::cancelled());
     }
     let path = saved_bridge_path(profile_id);
+    #[cfg(unix)]
+    let bridge = QuicBridge::start(
+        QuicBridgeConfig {
+            target: target.to_owned(),
+            remote_herdr,
+            session: session.to_owned(),
+            ssh_options: ssh.options().cloned(),
+            noninteractive: true,
+            transport: crate::config::Config::load().config.remote.transport,
+            logical_client_id: QuicBridgeConfig::process_logical_client_id(),
+        },
+        path.clone(),
+    )?;
+    #[cfg(not(unix))]
     let bridge = SshStdioBridge::start(
         target.to_owned(),
         remote_herdr,

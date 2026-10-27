@@ -52,6 +52,9 @@ const WINDOWS_REMOTE_INSTALL_DIR_MARKER: &str = "herdr-remote-install-dir:1:";
 const WINDOWS_REMOTE_INSTALL_RESULT_MARKER: &str = "herdr-remote-install-result:1:";
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
 pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+    // The launcher owns the SSH bootstrap and the QUIC bridge; without a file
+    // sink their transport events (ladder steps, roaming, fallback) vanish.
+    crate::logging::init_file_logging("herdr-remote.log");
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
     let local_socket = local_forward_socket_path(&remote.target, &session_name);
@@ -65,10 +68,8 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.keybindings,
         remote.live_handoff,
     );
-    let manage_ssh_config = crate::config::Config::load()
-        .config
-        .remote
-        .manage_ssh_config;
+    let remote_config = crate::config::Config::load().config.remote;
+    let manage_ssh_config = remote_config.manage_ssh_config;
     let require_surface_interest = crate::client::endpoint::EndpointCatalog::load()
         .map(|catalog| catalog.contains_enabled_target_session(&remote.target, &session_name))
         .unwrap_or(false);
@@ -87,6 +88,20 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         require_surface_interest,
     )?;
 
+    #[cfg(unix)]
+    let _bridge = super::quic_bridge::QuicBridge::start(
+        super::quic_bridge::QuicBridgeConfig {
+            target: remote.target.clone(),
+            remote_herdr: prepared_remote.remote_herdr,
+            session: session_name.clone(),
+            ssh_options: remote_ssh.options().cloned(),
+            noninteractive: false,
+            transport: remote_config.transport,
+            logical_client_id: super::quic_bridge::QuicBridgeConfig::process_logical_client_id(),
+        },
+        local_socket.clone(),
+    )?;
+    #[cfg(not(unix))]
     let _bridge = SshStdioBridge::start(
         remote.target.clone(),
         prepared_remote.remote_herdr,
@@ -481,6 +496,10 @@ pub(super) struct RemoteHerdr {
 }
 
 impl RemoteHerdr {
+    pub(super) fn bridge_command(&self, session_name: &str) -> String {
+        self.executable.bridge_command(session_name)
+    }
+
     pub(super) fn machine_metadata(&self) -> Option<crate::client::endpoint::SshMachineMetadata> {
         let executable = self.resolved_executable.clone()?;
         let metadata = crate::client::endpoint::SshMachineMetadata {
@@ -516,10 +535,18 @@ impl RemoteHerdr {
         self
     }
 
-    fn with_windows_path(mut self, path: String) -> Self {
+fn with_windows_path(mut self, path: String) -> Self {
         self.resolved_executable = Some(path.clone());
         self.executable = RemoteExecutable::WindowsPath(path);
         self
+    }
+
+    /// A remote Herdr at an explicit path on a Linux x86_64 host, for live
+    /// loopback tests that must not touch the installed binary.
+    #[cfg(all(test, unix))]
+    pub(super) fn for_test_binary(path: &std::path::Path) -> Self {
+        let platform = RemotePlatform::from_uname("Linux", "x86_64").expect("linux platform");
+        Self::for_platform(platform).with_posix_path(&path.to_string_lossy())
     }
 }
 
@@ -1400,7 +1427,7 @@ fn decode_windows_remote_path(encoded: &str) -> io::Result<String> {
     Ok(path)
 }
 
-fn apply_noninteractive_ssh_options(command: &mut Command) {
+pub(super) fn apply_noninteractive_ssh_options(command: &mut Command) {
     command
         .arg("-o")
         .arg("BatchMode=yes")
@@ -1418,7 +1445,7 @@ fn apply_noninteractive_ssh_options(command: &mut Command) {
         .arg("ServerAliveCountMax=4");
 }
 
-fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
+pub(super) fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
     // Compress the first connection too: multiplexed bridges inherit the master's transport.
     command.arg("-C");
     let Some(options) = options else {
@@ -2882,6 +2909,21 @@ fn confirm_remote_install(
     Ok(())
 }
 
+pub(super) fn remote_session_command(
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    args: &str,
+) -> String {
+    let mut command = remote_herdr.executable.command(&[]);
+    if session_name != crate::session::DEFAULT_SESSION_NAME {
+        command.push_str(" --session ");
+        command.push_str(&shell_quote(session_name));
+    }
+    command.push(' ');
+    command.push_str(args);
+    command
+}
+
 fn posix_remote_api_discovery_script(platform: &RemotePlatform, session: &str) -> String {
     format!(
         r#"set -f
@@ -2983,7 +3025,7 @@ fn reattach_command(
     command
 }
 
-fn command_failed(context: &str, output: &Output) -> io::Error {
+pub(super) fn command_failed(context: &str, output: &Output) -> io::Error {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
     if stderr.is_empty() {
@@ -3256,7 +3298,7 @@ pub(crate) fn bridge_upload_cancellation_for_test(
     }
 }
 
-fn bridge_connection(
+pub(super) fn bridge_connection(
     stream: crate::ipc::LocalStream,
     target: &str,
     remote_command: &str,

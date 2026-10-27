@@ -212,6 +212,24 @@ impl EndpointRegistry {
         }
     }
 
+    /// Local transport hint: the endpoint's path is recovering (true) or back
+    /// to normal (false). Never sent by a server.
+    pub(crate) fn set_recovering(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        generation: u64,
+        recovering: bool,
+    ) {
+        if let Some(health) = self
+            .connections
+            .get_mut(endpoint_id)
+            .filter(|connection| connection.generation == generation)
+            .and_then(|connection| connection.health.as_mut())
+        {
+            health.set_recovering(recovering);
+        }
+    }
+
     pub(crate) fn tick_health(&mut self, now: Instant) {
         // The client could not consume queued replies during a local scheduling pause.
         if now.saturating_duration_since(self.last_health_tick) > super::health::HEARTBEAT_TIMEOUT {

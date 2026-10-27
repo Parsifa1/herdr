@@ -402,6 +402,17 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # startup_per_agent_delay_ms = 100
 
 [remote]
+# Live transport for remote clients: auto (SSH-bootstrapped QUIC when the
+# server offers it, SSH stdio bridge otherwise) or ssh.
+# transport = "auto"
+# Inclusive UDP range for the lazy, per-server-process QUIC listener.
+# quic_port_range = "48000-48100"
+# How long an SSH-minted QUIC credential stays valid for fresh reconnects
+# without re-running SSH.
+# quic_idle_timeout_seconds = 86400
+# How long a silent QUIC connection is kept before the server declares it
+# dead (10-600).
+# quic_transport_idle_timeout_seconds = 180
 # Whether herdr manages the ssh config used for `herdr --remote`.
 # When true (default), herdr runs remote ssh through a generated config that
 # includes your ~/.ssh/config first and adds ServerAliveInterval/
@@ -564,6 +575,9 @@ fn main() -> io::Result<()> {
     // Subcommands and flags (no TUI, no logging needed)
     if args.get(1).map(|s| s.as_str()) == Some("remote-client-bridge") {
         return remote::run_remote_client_bridge(&args[2..]);
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("remote-quic-bootstrap") {
+        return remote::run_remote_quic_bootstrap(args.get(2).map(String::as_str));
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
@@ -765,6 +779,7 @@ fn main() -> io::Result<()> {
                 "server",
                 "client",
                 "remote-client-bridge",
+                "remote-quic-bootstrap",
                 "update",
                 "status",
                 "config",
