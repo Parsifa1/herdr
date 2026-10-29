@@ -56,6 +56,7 @@
           pkgs = pkgsFor system;
           herdr = pkgs.callPackage ./nix/package.nix {
             rustPlatform = rustPlatformFor pkgs;
+            commitHash = self.rev or null;
           };
         in
         {
@@ -110,6 +111,7 @@
         final: _prev: {
           herdr = final.callPackage ./nix/package.nix {
             rustPlatform = rustPlatformFor final;
+            commitHash = self.rev or null;
           };
         }
       );

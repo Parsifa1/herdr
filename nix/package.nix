@@ -10,6 +10,7 @@
   git,
   cctools ? null,
   xcbuild ? null,
+  commitHash ? null,
 }:
 
 let
@@ -69,6 +70,7 @@ rustPlatform.buildRustPackage {
     LIBGHOSTTY_VT_SIMD = "true";
     LIBGHOSTTY_VT_ZIG_SYSTEM_DIR = zigDeps;
     ZIG = lib.getExe zig_0_16;
+    HERDR_BUILD_COMMIT = lib.optionalString (commitHash != null) commitHash;
   };
 
   preBuild = ''

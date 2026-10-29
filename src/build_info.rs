@@ -11,13 +11,22 @@ pub fn build_id() -> Option<&'static str> {
 }
 
 pub fn version() -> String {
-    match channel() {
-        "stable" => format!("{BASE_VERSION} (with quic)"),
-        channel => match build_id() {
-            Some(build_id) => format!("{BASE_VERSION}-{channel}.{build_id}"),
-            None => format!("{BASE_VERSION}-{channel}"),
+    let suffix = match (build_commit(), channel()) {
+        (Some(commit), _) => format!(" (with quic, {commit})"),
+        (None, "stable") => " (with quic)".to_string(),
+        (None, channel) => match build_id() {
+            Some(build_id) => format!("-{channel}.{build_id}"),
+            None => format!("-{channel}"),
         },
-    }
+    };
+    format!("{BASE_VERSION}{suffix}")
+}
+
+fn build_commit() -> Option<&'static str> {
+    non_empty(option_env!("HERDR_BUILD_COMMIT")).map(|commit| {
+        // Short hash, like git's --format=%h
+        &commit[..commit.len().min(7)]
+    })
 }
 
 pub fn is_preview() -> bool {
