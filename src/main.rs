@@ -579,6 +579,10 @@ fn main() -> io::Result<()> {
     if args.get(1).map(|s| s.as_str()) == Some("remote-quic-bootstrap") {
         return remote::run_remote_quic_bootstrap(args.get(2).map(String::as_str));
     }
+    #[cfg(unix)]
+    if args.get(1).map(|s| s.as_str()) == Some("remote-bridge-daemon") {
+        return remote::run_remote_bridge_daemon(&args[2..]);
+    }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
         return server::headless::run_server();

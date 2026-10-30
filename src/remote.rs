@@ -12,6 +12,8 @@ mod quic;
 mod quic_bridge;
 #[cfg(unix)]
 pub(crate) mod quic_policy;
+#[cfg(unix)]
+mod quic_saved;
 mod restart_policy;
 mod saved;
 #[cfg(unix)]
@@ -22,6 +24,8 @@ pub(crate) use attach::*;
 pub(crate) use host::run_remote_client_bridge;
 #[cfg(unix)]
 pub(crate) use host::run_remote_quic_bootstrap;
+#[cfg(unix)]
+pub(crate) use quic_saved::run_remote_bridge_daemon;
 pub(crate) use saved::*;
 
 #[cfg(windows)]

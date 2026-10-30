@@ -12,9 +12,17 @@ use super::quic_bridge::{QuicBridge, QuicBridgeConfig};
 
 pub(crate) struct SavedSshBridge {
     #[cfg(unix)]
-    _bridge: QuicBridge,
+    _bridge: Option<QuicBridge>,
     #[cfg(not(unix))]
-    _bridge: SshStdioBridge,
+    _bridge: Option<SshStdioBridge>,
+}
+
+impl SavedSshBridge {
+    /// No bridge to hold: the stream runs through a persisted daemon.
+    #[cfg(unix)]
+    fn none() -> Self {
+        Self { _bridge: None }
+    }
 }
 
 pub(crate) struct SavedSshStream {
@@ -28,6 +36,25 @@ pub(crate) fn connect_saved_ssh(
     session: &str,
     cancelled: Arc<AtomicBool>,
 ) -> io::Result<SavedSshStream> {
+    // A persisted bridge daemon from a previous connection still holds the
+    // remote transport and a warmed credential; attaching through it skips
+    // every SSH round trip, exactly like hitting a live ControlMaster.
+    #[cfg(unix)]
+    if crate::config::Config::load().config.remote.transport
+        != crate::config::RemoteTransportConfig::Ssh
+    {
+        if let Ok(persisted) = super::quic_saved::connect_persisted_quic(
+            profile_id,
+            target,
+            session,
+            Arc::clone(&cancelled),
+        ) {
+            return Ok(SavedSshStream {
+                stream: persisted.stream,
+                bridge: SavedSshBridge::none(),
+            });
+        }
+    }
     let mut ssh = validated_saved_ssh(profile_id, target, session)?;
     ssh.cancelled = Arc::clone(&cancelled);
     ssh.prepare_shared_transport()?;
@@ -71,7 +98,9 @@ pub(crate) fn connect_saved_ssh(
     }
     Ok(SavedSshStream {
         stream,
-        bridge: SavedSshBridge { _bridge: bridge },
+        bridge: SavedSshBridge {
+            _bridge: Some(bridge),
+        },
     })
 }
 
@@ -205,7 +234,11 @@ fn saved_bridge_path(profile_id: &str) -> PathBuf {
     crate::platform::remote_bridge_endpoint_path(&readable, &short)
 }
 
-fn validated_saved_ssh(profile_id: &str, target: &str, session: &str) -> io::Result<RemoteSsh> {
+pub(super) fn validated_saved_ssh(
+    profile_id: &str,
+    target: &str,
+    session: &str,
+) -> io::Result<RemoteSsh> {
     validate_profile_path_id(profile_id)?;
     crate::session::validate_name(session)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
