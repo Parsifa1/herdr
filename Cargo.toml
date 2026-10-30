@@ -104,6 +104,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+testcontainers = "0.28"
+
 [profile.release]
 lto = "thin"
 strip = true
