@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+- Saved SSH machines reconnect through a persisted QUIC bridge. After you detach, a bridge daemon keeps the connection's credential alive (like SSH `ControlMaster`), so opening the machine again skips SSH discovery and the QUIC bootstrap entirely and attaches in one local hop. The daemon exits on its own after 10 idle minutes. Set `remote.transport = "ssh"` to opt out.
+- Remote connections over `herdr --remote` can run a QUIC transport bootstrapped over SSH, falling back to the SSH bridge automatically when UDP is unavailable.
+
 ## [0.9.5] - 2026-10-14
 
 This is a hotfix release for v0.9.4. See the v0.9.4 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.4
