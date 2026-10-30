@@ -20,7 +20,7 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -132,10 +132,22 @@ pub(crate) struct QuicBridge {
     local_socket: PathBuf,
     socket_identity: crate::ipc::SocketFileIdentity,
     should_stop: Arc<AtomicBool>,
+    idle_timeout_secs: Arc<AtomicU64>,
     thread: Option<JoinHandle<()>>,
 }
 
+/// A persisted bridge exits once no local client has attached for this long,
+/// mirroring SSH `ControlPersist`. Zero (the default) means never idle out.
+const PERSISTED_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
 impl QuicBridge {
+    /// Arm the idle watchdog: exit once no local client attaches for the
+    /// persist window (SSH `ControlPersist` semantics).
+    pub(crate) fn persist_when_idle(&self) {
+        self.idle_timeout_secs
+            .store(PERSISTED_IDLE_TIMEOUT.as_secs(), Ordering::Release);
+    }
+
     pub(crate) fn start(config: QuicBridgeConfig, local_socket: PathBuf) -> io::Result<Self> {
         crate::ipc::prepare_socket_path(&local_socket, |path| {
             format!("remote bridge is already listening at {}", path.display())
@@ -155,11 +167,15 @@ impl QuicBridge {
 
         let config = Arc::new(config);
         let should_stop = Arc::new(AtomicBool::new(false));
+        let idle_timeout_secs = Arc::new(AtomicU64::new(0));
         let thread_stop = Arc::clone(&should_stop);
+        let thread_idle = Arc::clone(&idle_timeout_secs);
         let thread = thread::spawn(move || {
+            let mut idle_since = Instant::now();
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok(mut stream) => {
+                        idle_since = Instant::now();
                         if let Err(err) = crate::ipc::set_local_stream_polling(&mut stream, false) {
                             tracing::error!(
                                 error = %err,
@@ -177,6 +193,17 @@ impl QuicBridge {
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(ACCEPT_POLL);
+                        let timeout_secs = thread_idle.load(Ordering::Acquire);
+                        if timeout_secs > 0
+                            && idle_since.elapsed()
+                                >= Duration::from_secs(timeout_secs).min(PERSISTED_IDLE_TIMEOUT)
+                        {
+                            // This is the only thread that observes idle;
+                            // exit the process so the parked main thread and
+                            // Drop's socket cleanup happen deterministically.
+                            info!("persisted remote bridge idled out");
+                            std::process::exit(0);
+                        }
                     }
                     Err(err) => {
                         if config.noninteractive {
@@ -194,6 +221,7 @@ impl QuicBridge {
             local_socket,
             socket_identity,
             should_stop,
+            idle_timeout_secs,
             thread: Some(thread),
         })
     }
