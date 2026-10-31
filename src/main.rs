@@ -780,22 +780,23 @@ fn main() -> io::Result<()> {
         }
         if !arg.starts_with('-')
             && ![
-                "server",
-                "client",
-                "remote-client-bridge",
-                "remote-quic-bootstrap",
-                "update",
-                "status",
-                "config",
-                "channel",
-                "machine",
-                "workspace",
-                "worktree",
-                "pane",
-                "session",
-                "integration",
-            ]
-            .contains(&arg.as_str())
+                    "server",
+                    "client",
+                    "remote-client-bridge",
+                    "remote-quic-bootstrap",
+                    "remote-bridge-daemon",
+                    "update",
+                    "status",
+                    "config",
+                    "channel",
+                    "machine",
+                    "workspace",
+                    "worktree",
+                    "pane",
+                    "session",
+                    "integration",
+                ]
+                .contains(&arg.as_str())
         {
             eprintln!("unknown command: {arg}");
             eprintln!("run 'herdr --help' for usage");
