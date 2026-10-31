@@ -30,8 +30,7 @@ use crate::protocol::{
 use crate::remote::frame::{hash_bytes, lock, read_async_message, write_async_message};
 use crate::remote::quic_policy::{
     REMOTE_QUIC_CLOSE_AUTH, REMOTE_QUIC_CLOSE_EVICTED, REMOTE_QUIC_CLOSE_HANDOFF,
-    REMOTE_QUIC_CLOSE_PROTOCOL, REMOTE_QUIC_CLOSE_REPLACED, REMOTE_QUIC_CLOSE_RESYNC,
-    REMOTE_QUIC_CLOSE_SHUTDOWN,
+    REMOTE_QUIC_CLOSE_PROTOCOL, REMOTE_QUIC_CLOSE_REPLACED, REMOTE_QUIC_CLOSE_SHUTDOWN,
 };
 
 const MAX_TOKENS: usize = 64;
@@ -504,9 +503,11 @@ fn transport_config(idle_timeout: Duration) -> Result<quinn::TransportConfig, io
     transport
         .max_idle_timeout(Some(idle))
         .keep_alive_interval(Some(KEEP_ALIVE_INTERVAL))
-        // One bidirectional stream carries the whole framed protocol; a peer
-        // that opens more is not speaking this transport.
-        .max_concurrent_bidi_streams(VarInt::from_u32(1))
+        // One control stream carries the hello and the health pings; every
+        // further bidirectional stream is one remote client session, so a
+        // multiplexing bridge can attach several clients over one
+        // connection.
+        .max_concurrent_bidi_streams(VarInt::from_u32(MAX_CLIENT_STREAMS))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
         .stream_receive_window(VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW))
         .receive_window(VarInt::from_u32(QUIC_RECEIVE_WINDOW))
@@ -588,6 +589,11 @@ fn make_endpoint(server_config: quinn::ServerConfig, socket: UdpSocket) -> io::R
 /// concurrent incoming, so without a bound an attacker can exhaust memory/CPU
 /// before ever authenticating. Excess handshakes are refused outright.
 const MAX_PREAUTH_CONNECTIONS: usize = 32;
+/// Client sessions one authenticated connection may carry as concurrent
+/// bidirectional streams. A bridge multiplexes every attached client onto
+/// one connection; the bound keeps a rogue peer from exhausting the
+/// stream map.
+const MAX_CLIENT_STREAMS: u32 = 128;
 
 async fn accept_connections(endpoint: Endpoint, state: Arc<ServerState>) {
     let admission = Arc::new(Semaphore::new(MAX_PREAUTH_CONNECTIONS));
@@ -628,17 +634,53 @@ async fn serve_connection(connection: Connection, state: Arc<ServerState>) -> Re
     };
 
     let fence = validate_and_fence(&state, &connection, &hello)?;
-    let outcome = adapt_connection(&connection, send, recv, &state, &hello).await;
-    if outcome.is_err() {
-        // The credential is untouched, so the client re-dials with the one it
-        // already holds rather than paying for another SSH bootstrap.
-        connection.close(
-            VarInt::from_u32(REMOTE_QUIC_CLOSE_RESYNC),
-            b"remote QUIC pipe failed",
-        );
+    // Reply on the hello stream before it becomes the liveness channel; a
+    // session then rides on its own stream, opened by the bridge.
+    let mut control_send = send;
+    write_async_message(
+        &mut control_send,
+        &RemoteQuicAccepted {
+            schema_version: REMOTE_QUIC_SCHEMA_VERSION,
+            connection_generation: hello.connection_generation,
+        },
+        MAX_FRAME_SIZE,
+    )
+    .await?;
+    let control = tokio::spawn(drain_control_stream(control_send, recv));
+    loop {
+        let (stream_send, stream_recv) = match connection.accept_bi().await {
+            Ok(pair) => pair,
+            Err(_) => break,
+        };
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(err) = serve_client_stream(stream_send, stream_recv, &state).await {
+                debug!(%err, "remote QUIC client stream ended");
+            }
+        });
     }
+    control.abort();
     clear_active_connection(&state, fence);
-    outcome
+    Ok(())
+}
+
+/// Reads the hello stream's halves open so the bridge's health pings keep a
+/// reader on the other side; the frames themselves stay opaque here.
+async fn drain_control_stream(
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> Result<(), String> {
+    // Any bytes here are opaque endpoint control frames. Read and discard
+    // them so they do not fill the stream's receive buffer; the send half is
+    // held open so the bridge never sees the liveness channel close.
+    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
+    let _ = &mut send;
+    loop {
+        match recv.read(&mut buffer).await {
+            Ok(Some(_read)) => {}
+            _ => return Ok(()),
+        }
+    }
 }
 
 /// Reads the first frame on the client's single bidirectional stream. Every
@@ -666,28 +708,17 @@ async fn accept_hello(
     Ok((send, recv, hello))
 }
 
-/// Turns the authenticated connection into an ordinary client of this server:
-/// one end of a Unix socketpair goes to the acceptor, and this task copies
-/// bytes between the other end and the QUIC stream. Nothing is decoded, so the
-/// client and server negotiate their protocol exactly as they do over a local
-/// socket.
-async fn adapt_connection(
-    connection: &Connection,
+/// Turns one bidirectional stream of the authenticated connection into an
+/// ordinary client of this server: one end of a Unix socketpair goes to the
+/// acceptor, and this task copies bytes between the other end and the QUIC
+/// stream. Nothing is decoded, so the client and server negotiate their
+/// protocol exactly as they do over a local socket. Closing the stream ends
+/// only this client session; the connection and its other streams live on.
+async fn serve_client_stream(
     mut send: SendStream,
     recv: RecvStream,
     state: &ServerState,
-    hello: &RemoteQuicHello,
 ) -> Result<(), String> {
-    write_async_message(
-        &mut send,
-        &RemoteQuicAccepted {
-            schema_version: REMOTE_QUIC_SCHEMA_VERSION,
-            connection_generation: hello.connection_generation,
-        },
-        MAX_FRAME_SIZE,
-    )
-    .await?;
-
     let (adapter_end, client_end) = tokio::net::UnixStream::pair()
         .map_err(|err| format!("failed to create the remote QUIC socket pair: {err}"))?;
     let client_end = client_end
@@ -698,16 +729,12 @@ async fn adapt_connection(
         .set_nonblocking(false)
         .map_err(|err| format!("failed to reset the remote QUIC client socket: {err}"))?;
     (state.sink)(client_end);
-
     let (local_read, local_write) = adapter_end.into_split();
     tokio::select! {
-        result = copy_stream(local_read, send) => {
-            // The acceptor closed its end: the client's session is over as far
-            // as the server is concerned, but the capability is still good.
-            connection.close(
-                VarInt::from_u32(REMOTE_QUIC_CLOSE_RESYNC),
-                b"client connection ended",
-            );
+        result = copy_stream(local_read, &mut send) => {
+            // The acceptor closed its end: this client's session is over as
+            // far as the server is concerned, but the capability and the
+            // connection stay good for the next stream.
             result.map_err(|err| format!("remote QUIC uplink failed: {err}"))
         }
         result = copy_stream(recv, local_write) => {
@@ -1100,7 +1127,8 @@ mod tests {
         }
     }
 
-    /// One real client, connected and past the hello handshake.
+    /// One real client, connected and past the hello handshake, with one
+    /// data stream open the way a multiplexing bridge attaches a session.
     struct LiveTestClient {
         _endpoint: Endpoint,
         connection: Connection,
@@ -1172,7 +1200,19 @@ mod tests {
             .expect("read accepted");
         assert_eq!(accepted.schema_version, REMOTE_QUIC_SCHEMA_VERSION);
         assert_eq!(accepted.connection_generation, connection_generation);
-        client
+        // The hello stream stays as the liveness channel; a session rides on
+        // its own stream, the way the multiplexing bridge attaches one.
+        let (send, recv) = client
+            .connection
+            .open_bi()
+            .await
+            .expect("open data stream");
+        LiveTestClient {
+            _endpoint: client._endpoint,
+            connection: client.connection,
+            send,
+            recv,
+        }
     }
 
     async fn closed_code(connection: &Connection) -> u64 {
@@ -1219,6 +1259,11 @@ mod tests {
         let record = mint(&server, 21);
         let mut client = connect_live_test_client(&record, 21, 1).await;
 
+        client
+            .send
+            .write_all(b"client-to-server")
+            .await
+            .expect("write uplink");
         let adapted = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
             .await
             .expect("the sink is handed a client socket")
@@ -1229,12 +1274,6 @@ mod tests {
         let mut adapted =
             tokio::net::UnixStream::from_std(adapted).expect("register the client socket");
 
-        client
-            .send
-            .write_all(b"client-to-server")
-            .await
-            .expect("write uplink");
-        client.send.flush().await.expect("flush uplink");
         let mut uplink = [0u8; 16];
         tokio::time::timeout(Duration::from_secs(5), adapted.read_exact(&mut uplink))
             .await
@@ -1256,13 +1295,62 @@ mod tests {
         .expect("read downlink");
         assert_eq!(&downlink, b"server-to-client");
 
-        // The acceptor dropping the client is a resync, not a reason to
-        // bootstrap a new credential.
+        // The acceptor dropping the client ends only that session's stream;
+        // the connection and its credential stay good for the next one.
         drop(adapted);
-        assert_eq!(
-            closed_code(&client.connection).await,
-            u64::from(REMOTE_QUIC_CLOSE_RESYNC)
-        );
+        let mut scratch = [0u8; 1];
+        let stream_end =
+            tokio::time::timeout(Duration::from_secs(5), client.recv.read(&mut scratch))
+                .await
+                .expect("stream settles after the acceptor leaves")
+                .expect("read the stream end");
+        assert_eq!(stream_end, None, "the data stream must see EOF");
+        assert!(client.connection.close_reason().is_none());
+    }
+
+    /// Minimal multiplexing proof: after the hello exchange, a second
+    /// open_bi on the same connection must reach the server's accept loop
+    /// and carry bytes both ways.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_stream_multiplexes_onto_the_connection() {
+        let TestServer {
+            server,
+            mut accepted,
+        } = test_server_on_free_port();
+        let record = mint(&server, 31);
+        let mut client = connect_live_test_client(&record, 31, 1).await;
+        client
+            .send
+            .write_all(b"ping")
+            .await
+            .expect("write ping");
+        let adapted = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
+            .await
+            .expect("the sink is handed a client socket")
+            .expect("sink channel open");
+        adapted
+            .set_nonblocking(true)
+            .expect("adapt the client socket");
+        let mut adapted =
+            tokio::net::UnixStream::from_std(adapted).expect("register the client socket");
+
+        let mut ping = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), adapted.read_exact(&mut ping))
+            .await
+            .expect("ping arrives")
+            .expect("read ping");
+        assert_eq!(&ping, b"ping");
+
+        adapted
+            .write_all(b"pong")
+            .await
+            .expect("write pong");
+        let mut pong = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.recv.read_exact(&mut pong))
+            .await
+            .expect("pong arrives")
+            .expect("read pong");
+        assert_eq!(&pong, b"pong");
     }
 
     /// A roamed client re-dials with the next generation of the same
@@ -1275,13 +1363,15 @@ mod tests {
             mut accepted,
         } = test_server_on_free_port();
         let record = mint(&server, 22);
-        let first = connect_live_test_client(&record, 22, 1).await;
+        let mut first = connect_live_test_client(&record, 22, 1).await;
+        first.send.write_all(b"x").await.expect("wake the accept loop");
         let _first_socket = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
             .await
             .expect("first client reaches the acceptor")
             .expect("sink channel open");
 
-        let second = connect_live_test_client(&record, 22, 2).await;
+        let mut second = connect_live_test_client(&record, 22, 2).await;
+        second.send.write_all(b"x").await.expect("wake the accept loop");
         assert_eq!(
             closed_code(&first.connection).await,
             u64::from(REMOTE_QUIC_CLOSE_REPLACED)
@@ -1319,9 +1409,10 @@ mod tests {
             mut accepted,
         } = test_server_on_free_port();
         let record = mint(&server, 23);
-        let first = connect_live_test_client(&record, 23, 2).await;
+        let mut first = connect_live_test_client(&record, 23, 2).await;
         // Held: dropping the acceptor's socket would end the live connection
         // for resync, which is not the rejection this test is about.
+        first.send.write_all(b"x").await.expect("wake the accept loop");
         let _first_socket = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
             .await
             .expect("first client reaches the acceptor")
@@ -1343,7 +1434,8 @@ mod tests {
             mut accepted,
         } = test_server_on_free_port();
         let record = mint(&server, 24);
-        let client = connect_live_test_client(&record, 24, 1).await;
+        let mut client = connect_live_test_client(&record, 24, 1).await;
+        client.send.write_all(b"x").await.expect("wake the accept loop");
         let _socket = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
             .await
             .expect("client reaches the acceptor")
