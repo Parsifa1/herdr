@@ -29,7 +29,7 @@ use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::ListenerNonblockingMode;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 use tracing::{debug, info, warn};
 
 use super::attach::{
@@ -39,7 +39,7 @@ use super::attach::{
 use super::frame::lock;
 use super::process::wait_with_output_timeout;
 use super::quic::{
-    ConnectError, PathMonitor, PathState, QuicClientParams, QuicSession, SessionExit, ROAMING_GRACE,
+    ConnectError, PathMonitor, PathState, QuicClientParams, QuicSession, SessionExit,
 };
 use crate::config::RemoteTransportConfig;
 use crate::protocol::endpoint::{HEALTH_PING_KIND, TRANSPORT_STATUS_KIND};
@@ -125,6 +125,7 @@ impl QuicBridgeConfig {
     }
 }
 
+
 /// Listener owning the local socket the thin client attaches to. Same shape as
 /// [`super::attach::SshStdioBridge`]: a private socket, one accept thread, and
 /// a stop flag that unblocks it.
@@ -168,6 +169,12 @@ impl QuicBridge {
         let config = Arc::new(config);
         let should_stop = Arc::new(AtomicBool::new(false));
         let idle_timeout_secs = Arc::new(AtomicU64::new(0));
+        let (client_tx, client_rx) = mpsc::unbounded_channel::<crate::ipc::LocalStream>();
+        let manager_config = Arc::clone(&config);
+        let manager_stop = Arc::clone(&should_stop);
+        thread::spawn(move || {
+            run_bridge_manager(client_rx, &manager_config, &manager_stop);
+        });
         let thread_stop = Arc::clone(&should_stop);
         let thread_idle = Arc::clone(&idle_timeout_secs);
         let thread = thread::spawn(move || {
@@ -183,12 +190,8 @@ impl QuicBridge {
                             );
                             continue;
                         }
-                        if let Err(err) = bridge_local_connection(stream, &config, &thread_stop) {
-                            if config.noninteractive {
-                                warn!(error = %err, "saved remote endpoint bridge failed");
-                            } else {
-                                eprintln!("herdr: remote bridge failed: {err}");
-                            }
+                        if client_tx.send(stream).is_err() {
+                            break;
                         }
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -374,213 +377,329 @@ fn quic_reconnect_delay(attempt: u32) -> Duration {
         .min(QUIC_RECONNECT_MAX_DELAY)
 }
 
-/// Where an accepted local connection ended up.
-enum RunOutcome {
-    /// The run is over; dropping the local stream closes the socket.
-    Done,
-    /// Carry the connection on the SSH stdio bridge.
-    Ssh {
-        stream: crate::ipc::LocalStream,
-        detail: String,
-    },
-}
 
-/// Either the ladder continues with an event, or this run is finished.
-enum Progress {
-    Event(LadderEvent),
-    Done,
-}
-
-fn bridge_local_connection(
-    stream: crate::ipc::LocalStream,
+/// Owns the shared QUIC session for the whole bridge: every local client the
+/// listener hands over rides one bidirectional stream of the same connection.
+///
+/// The first client still runs the full ladder (bootstrap, dial, SSH
+/// fallback) inline; the session it leaves behind is kept here and reused, so
+/// the second client never mints a new generation and never fences the first.
+/// When the connection dies, every client's stream ends with it; the next
+/// client pays for a fresh dial, exactly like a reconnecting thin client.
+fn run_bridge_manager(
+    mut clients: tokio::sync::mpsc::UnboundedReceiver<crate::ipc::LocalStream>,
     config: &Arc<QuicBridgeConfig>,
     should_stop: &Arc<AtomicBool>,
-) -> io::Result<()> {
-    let outcome = if config.transport == RemoteTransportConfig::Ssh {
-        RunOutcome::Ssh {
-            stream,
-            detail: "remote.transport is set to ssh".to_owned(),
-        }
-    } else {
-        run_quic_ladder(stream, config, should_stop)
-    };
-
-    match outcome {
-        RunOutcome::Done => Ok(()),
-        RunOutcome::Ssh { stream, detail } => {
-            info!(
-                target = %config.target,
-                %detail,
-                "carrying the remote client on the SSH stdio bridge"
-            );
-            let remote_command = config.remote_herdr.bridge_command(&config.session);
-            bridge_connection(
-                stream,
-                &config.target,
-                &remote_command,
-                config.ssh_options.as_ref(),
-                config.noninteractive,
-                should_stop,
-            )
-        }
-    }
-}
-
-fn run_quic_ladder(
-    stream: crate::ipc::LocalStream,
-    config: &Arc<QuicBridgeConfig>,
-    should_stop: &Arc<AtomicBool>,
-) -> RunOutcome {
+) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
         Err(err) => {
-            return RunOutcome::Ssh {
-                stream,
-                detail: format!("failed to start the QUIC runtime: {err}"),
-            }
+            report_bridge_error(config, &format!("failed to start the QUIC runtime: {err}"));
+            return;
         }
     };
 
+    let mut shared: Option<Arc<QuicSession>> = None;
+    let (states_tx, _) = broadcast::channel::<Vec<u8>>(16);
     let key = credential_key(config);
-    // Taken by whichever rung consumes the local connection: the QUIC pump, or
-    // the SSH stdio bridge.
-    let mut local = Some(stream);
+
+    while !should_stop.load(Ordering::Acquire) {
+        let stream = match runtime.block_on(async {
+            tokio::select! {
+                received = clients.recv() => received,
+                () = wait_for_stop(should_stop) => None,
+            }
+        }) {
+            Some(stream) => stream,
+            None => break,
+        };
+
+        if config.transport == RemoteTransportConfig::Ssh {
+            if let Err(err) = carry_on_ssh(stream, config, should_stop) {
+                report_bridge_error(config, &err.to_string());
+            }
+            continue;
+        }
+
+        let session = match acquire_shared_session(
+            &runtime,
+            config,
+            should_stop,
+            &key,
+            &mut shared,
+            &states_tx,
+        ) {
+            Acquired::Live(session) => session,
+            Acquired::Ssh => {
+                if let Err(err) = carry_on_ssh(stream, config, should_stop) {
+                    report_bridge_error(config, &err.to_string());
+                }
+                continue;
+            }
+            Acquired::Stopped => break,
+        };
+
+        let states = states_tx.subscribe();
+        runtime.spawn(async move {
+            let (send, recv) = match session.open_bi().await {
+                Ok(pair) => pair,
+                Err(detail) => {
+                    debug!(%detail, "remote QUIC data stream did not open");
+                    return;
+                }
+            };
+            let local = match into_std_stream(stream) {
+                Ok(local) => local,
+                Err(err) => {
+                    warn!(error = %err, "remote bridge could not hand the local socket to QUIC");
+                    return;
+                }
+            };
+            let local = match tokio::net::UnixStream::from_std(local) {
+                Ok(local) => local,
+                Err(err) => {
+                    warn!(error = %err, "remote bridge could not register the local socket");
+                    return;
+                }
+            };
+            let _ = run_data_pump(send, recv, local, states).await;
+        });
+    }
+}
+
+async fn wait_for_stop(should_stop: &AtomicBool) {
+    while !should_stop.load(Ordering::Acquire) {
+        tokio::time::sleep(SHUTDOWN_POLL).await;
+    }
+}
+
+enum Acquired {
+    Live(Arc<QuicSession>),
+    Ssh,
+    Stopped,
+}
+
+/// Return the live shared session, dialing one when none exists. A dial that
+/// fails over to SSH is reported as `Ssh` so the caller carries this client on
+/// the SSH stdio bridge without touching the shared state.
+fn acquire_shared_session(
+    runtime: &tokio::runtime::Runtime,
+    config: &Arc<QuicBridgeConfig>,
+    should_stop: &Arc<AtomicBool>,
+    key: &CredentialKey,
+    shared: &mut Option<Arc<QuicSession>>,
+    states: &broadcast::Sender<Vec<u8>>,
+) -> Acquired {
+    if should_stop.load(Ordering::Acquire) {
+        return Acquired::Stopped;
+    }
+    if let Some(session) = shared {
+        if session.is_closed() {
+            *shared = None;
+        } else {
+            return Acquired::Live(Arc::clone(session));
+        }
+    }
+
     let mut state = LadderState::default();
+    let mut dial = match credential(config, key) {
+        Ok(reserved) => reserved,
+        Err(detail) => {
+            report_bridge_error(config, &detail);
+            return Acquired::Ssh;
+        }
+    };
     let mut step = LadderStep::ConnectQuic {
         delay: Duration::ZERO,
     };
-
     loop {
-        let event = match step {
+        match step {
             LadderStep::ConnectQuic { delay } => {
                 if !sleep_interruptible(delay, should_stop) {
-                    return RunOutcome::Done;
+                    return Acquired::Stopped;
                 }
-                match credential(config, &key) {
-                    Err(detail) => LadderEvent::BootstrapFailed(detail),
-                    Ok(credential) => {
-                        state.credential_proven = credential.proven;
-                        match connect_and_pump(
-                            &runtime,
-                            config,
-                            credential,
-                            &mut local,
-                            should_stop,
-                        ) {
-                            Progress::Event(event) => {
-                                if let LadderEvent::SessionEnded(exit) = &event {
-                                    if credential_is_dead(exit) {
-                                        drop_credential(&key);
-                                    }
-                                }
-                                event
-                            }
-                            Progress::Done => return RunOutcome::Done,
-                        }
+                let params = QuicClientParams {
+                    candidates: dial.candidates.clone(),
+                    fingerprint: dial.record.certificate_fingerprint,
+                    hello: RemoteQuicHello {
+                        schema_version: REMOTE_QUIC_SCHEMA_VERSION,
+                        server_instance_id: dial.record.server_instance_id,
+                        logical_client_id: config.logical_client_id,
+                        capability_token: dial.record.capability_token,
+                        connection_generation: dial.generation,
+                    },
+                };
+                let event = match runtime.block_on(QuicSession::connect(params)) {
+                    Ok((connected, control_send, control_recv)) => {
+                        let connected = Arc::new(connected);
+                        runtime.spawn(run_control_pump(
+                            Arc::clone(&connected),
+                            control_send,
+                            control_recv,
+                            states.clone(),
+                        ));
+                        let session = connected;
+                        info!(
+                            target = %config.target,
+                            generation = dial.generation,
+                            "remote QUIC transport connected"
+                        );
+                        mark_credential_proven(key);
+                        *shared = Some(Arc::clone(&session));
+                        return Acquired::Live(session);
+                    }
+                    Err(err) => LadderEvent::ConnectFailed(err),
+                };
+                if let LadderEvent::ConnectFailed(ConnectError::Rejected(exit)) = &event {
+                    if credential_is_dead(exit) {
+                        drop_credential(key);
                     }
                 }
+                step = next_step(&mut state, event);
             }
-            LadderStep::Rebootstrap => match rebootstrap(config, &key, should_stop) {
-                Ok(()) => LadderEvent::Bootstrapped,
-                Err(detail) => LadderEvent::BootstrapFailed(detail),
+            LadderStep::Rebootstrap => match rebootstrap(config, key, should_stop) {
+                Ok(()) => match credential(config, key) {
+                    Ok(fresh) => {
+                        dial = fresh;
+                        step = LadderStep::ConnectQuic {
+                            delay: Duration::ZERO,
+                        };
+                    }
+                    Err(detail) => {
+                        report_bridge_error(config, &detail);
+                        return Acquired::Ssh;
+                    }
+                },
+                Err(detail) => {
+                    report_bridge_error(config, &detail);
+                    return Acquired::Ssh;
+                }
             },
             LadderStep::ProbeSsh(detail) => match ssh_port_reachable(config) {
                 Ok(()) => {
                     debug!(target = %config.target, %detail, "SSH port answers; re-dialing QUIC once");
-                    LadderEvent::SshReachable
+                    step = LadderStep::ConnectQuic {
+                        delay: Duration::ZERO,
+                    };
                 }
-                Err(probe) => LadderEvent::SshUnreachable(format!(
-                    "retryable: {detail}; SSH port unreachable too ({probe})"
-                )),
+                Err(_) => {
+                    report_bridge_error(config, &detail);
+                    return Acquired::Ssh;
+                }
             },
             LadderStep::SshFallback(detail) => {
-                let Some(stream) = local.take() else {
-                    // Unreachable: a live session always ends the run, so the
-                    // local connection is still here whenever SSH is chosen.
-                    return RunOutcome::Done;
-                };
-                return RunOutcome::Ssh { stream, detail };
+                report_bridge_error(config, &detail);
+                return Acquired::Ssh;
             }
             LadderStep::CloseLocal(detail) => {
-                info!(
-                    target = %config.target,
-                    %detail,
-                    "closing the local remote socket; the client reconnects the ladder"
-                );
-                return RunOutcome::Done;
+                report_bridge_error(config, &detail);
+                return Acquired::Ssh;
             }
-        };
-        step = next_step(&mut state, event);
+        }
     }
 }
 
-/// Dial the credential, then pump frames until the connection or the local
-/// client ends.
-fn connect_and_pump(
-    runtime: &tokio::runtime::Runtime,
-    config: &QuicBridgeConfig,
-    credential: Credential,
-    local: &mut Option<crate::ipc::LocalStream>,
-    should_stop: &AtomicBool,
-) -> Progress {
-    let Credential {
-        record,
-        candidates,
-        generation,
-        proven: _,
-    } = credential;
-    let params = QuicClientParams {
-        candidates,
-        fingerprint: record.certificate_fingerprint,
-        hello: RemoteQuicHello {
-            schema_version: REMOTE_QUIC_SCHEMA_VERSION,
-            server_instance_id: record.server_instance_id,
-            logical_client_id: config.logical_client_id,
-            capability_token: record.capability_token,
-            connection_generation: generation,
-        },
-    };
-
-    let (session, send, recv) = match runtime.block_on(QuicSession::connect(params)) {
-        Ok(connected) => connected,
-        Err(err) => return Progress::Event(LadderEvent::ConnectFailed(err)),
-    };
-
-    let Some(stream) = local.take() else {
-        // Unreachable: only one dial per run reaches this point.
-        session.close(CLOSE_BRIDGE_DONE, b"bridge done");
-        return Progress::Done;
-    };
-    let stream = match into_std_stream(stream) {
-        Ok(stream) => stream,
-        Err(err) => {
-            warn!(error = %err, "remote bridge could not hand the local socket to QUIC");
-            session.close(CLOSE_BRIDGE_DONE, b"bridge done");
-            return Progress::Done;
+/// Drive the control stream of the shared connection: send health pings on the
+/// monitor's schedule, rebind the local socket when the silence looks like a
+/// local address change, and tear the connection down when the path is lost.
+async fn run_control_pump(
+    session: Arc<QuicSession>,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    states: broadcast::Sender<Vec<u8>>,
+) {
+    let ping = match health_ping_frame() {
+        Ok(ping) => ping,
+        Err(detail) => {
+            debug!(%detail, "remote QUIC control pump could not encode its probe");
+            return;
         }
     };
+    let mut monitor = PathMonitor::new(Instant::now());
+    let mut buffer = vec![0u8; FRAME_HEADER_BYTES];
+    loop {
+        let deadline = tokio::time::Instant::from_std(monitor.next_deadline(Instant::now()));
+        tokio::select! {
+            read = recv.read(&mut buffer) => {
+                match read {
+                    Ok(Some(_)) => {
+                        if let Some(state) = monitor.received(Instant::now()) {
+                            info!(?state, "remote QUIC path recovered");
+                            if let Some(frame) = transport_state_frame_for(state) {
+                                let _ = states.send(frame);
+                            }
+                        }
+                    }
+                    _ => return,
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                let now = Instant::now();
+                let outcome = monitor.on_tick(now);
+                if outcome.probe {
+                    if let Err(detail) = write_frame(&mut send, &ping).await {
+                        debug!(%detail, "remote QUIC control probe failed");
+                        return;
+                    }
+                    monitor.probe_sent(now);
+                }
+                if outcome.rebind {
+                    match session.rebind() {
+                        Ok(()) => info!("remote QUIC socket rebound"),
+                        Err(detail) => debug!(%detail, "remote QUIC socket rebind failed"),
+                    }
+                }
+                if let Some(PathState::Lost) = outcome.transition {
+                    session.close(CLOSE_BRIDGE_DONE, b"bridge done");
+                    return;
+                }
+                if let Some(state) = outcome.transition {
+                    info!(?state, "remote QUIC path silent; recovering");
+                    if let Some(frame) = transport_state_frame_for(state) {
+                        let _ = states.send(frame);
+                    }
+                }
+            }
+        }
+    }
+}
 
+fn transport_state_frame_for(state: PathState) -> Option<Vec<u8>> {
+    transport_state_name(state).and_then(|name| transport_status_frame(name).ok())
+}
+
+/// Carry one local client on the SSH stdio bridge, used when the shared QUIC
+/// dial cannot be established at all.
+fn carry_on_ssh(
+    stream: crate::ipc::LocalStream,
+    config: &Arc<QuicBridgeConfig>,
+    should_stop: &Arc<AtomicBool>,
+) -> io::Result<()> {
     info!(
         target = %config.target,
-        generation,
-        "remote QUIC transport connected"
+        "carrying the remote client on the SSH stdio bridge"
     );
-    mark_credential_proven(&credential_key(config));
-    let exit = runtime.block_on(run_pump(&session, send, recv, stream, should_stop));
-    session.close(CLOSE_BRIDGE_DONE, b"bridge done");
-
-    match exit {
-        PumpExit::LocalClosed | PumpExit::Stopped => Progress::Done,
-        PumpExit::Closed(exit) => Progress::Event(LadderEvent::SessionEnded(exit)),
-        PumpExit::Ended(detail) => {
-            Progress::Event(LadderEvent::SessionEnded(SessionExit::Retry(detail)))
-        }
-    }
+    let remote_command = config.remote_herdr.bridge_command(&config.session);
+    bridge_connection(
+        stream,
+        &config.target,
+        &remote_command,
+        config.ssh_options.as_ref(),
+        config.noninteractive,
+        should_stop,
+    )
 }
 
+fn report_bridge_error(config: &QuicBridgeConfig, detail: &str) {
+    if config.noninteractive {
+        warn!(target = %config.target, detail, "saved remote endpoint bridge failed");
+    } else {
+        eprintln!("herdr: remote bridge failed: {detail}");
+    }
+}
 /// Whether the credential the bridge holds is worth keeping after this exit.
 fn credential_is_dead(exit: &SessionExit) -> bool {
     match exit {
@@ -617,34 +736,23 @@ fn sleep_interruptible(total: Duration, should_stop: &AtomicBool) -> bool {
 enum PumpExit {
     /// The thin client hung up.
     LocalClosed,
-    /// Bridge shutdown was requested.
-    Stopped,
-    /// The QUIC connection closed, classified by what may happen next.
-    Closed(SessionExit),
     /// The pipe ended locally — path lost, stream error — so the next
     /// connection has to be a brand-new one.
     Ended(String),
 }
 
-/// Copy frames between the local socket and the QUIC stream until one side
-/// ends, while [`PathMonitor`] probes and rebinds the path underneath.
-async fn run_pump(
-    session: &QuicSession,
+/// Copy frames between one local client and its own QUIC data stream. The
+/// connection, its control stream, and every other client's stream outlive
+/// this pump: ending here closes only this client's stream.
+async fn run_data_pump(
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    local: std::os::unix::net::UnixStream,
-    should_stop: &AtomicBool,
+    local: tokio::net::UnixStream,
+    mut states: broadcast::Receiver<Vec<u8>>,
 ) -> PumpExit {
-    let local = match tokio::net::UnixStream::from_std(local) {
-        Ok(local) => local,
-        Err(err) => return PumpExit::Ended(format!("failed to register the local socket: {err}")),
-    };
     let (mut local_read, local_write) = local.into_split();
     let send = AsyncMutex::new(send);
     let local_write = AsyncMutex::new(local_write);
-    // Depth one: the monitor only needs to know that *something* arrived, so a
-    // receipt dropped because one is already pending loses no information.
-    let (receipts_tx, receipts_rx) = mpsc::channel(1);
 
     let uplink = async {
         match copy_frames(&mut local_read, &send, MAX_FRAME_SIZE, None).await {
@@ -653,31 +761,34 @@ async fn run_pump(
         }
     };
     let downlink = async {
-        match copy_frames(
-            &mut recv,
-            &local_write,
-            MAX_GRAPHICS_FRAME_SIZE,
-            Some(receipts_tx),
-        )
-        .await
-        {
+        match copy_frames(&mut recv, &local_write, MAX_GRAPHICS_FRAME_SIZE, None).await {
             Ok(()) => PumpExit::Ended("remote QUIC stream ended".to_owned()),
             Err(detail) => PumpExit::Ended(detail),
         }
     };
-    let monitor = drive_path(session, &send, &local_write, receipts_rx);
-    let stop = wait_for_stop(should_stop);
-    tokio::pin!(uplink, downlink, monitor, stop);
-
+    let hints = async {
+        loop {
+            match states.recv().await {
+                Ok(frame) => {
+                    let mut writer = local_write.lock().await;
+                    if write_frame(&mut *writer, &frame).await.is_err() {
+                        return PumpExit::Ended("local socket rejected the path hint".to_owned());
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => {
+                    return PumpExit::Ended("control pump is gone".to_owned());
+                }
+            }
+        }
+    };
+    tokio::pin!(uplink, downlink, hints);
     tokio::select! {
         exit = &mut uplink => exit,
         exit = &mut downlink => exit,
-        exit = &mut monitor => exit,
-        exit = session.closed() => PumpExit::Closed(exit),
-        () = &mut stop => PumpExit::Stopped,
+        exit = &mut hints => exit,
     }
 }
-
 /// Copy length-prefixed frames from `reader` to `writer` until the reader ends
 /// cleanly.
 ///
@@ -755,103 +866,20 @@ where
         .map_err(|err| format!("frame flush failed: {err}"))
 }
 
-/// Own path liveness for a live connection: probe on the monitor's schedule,
-/// rebind the local socket when the silence looks like a local address change,
-/// and tell the thin client when the path starts or stops recovering.
-async fn drive_path<S, L>(
-    session: &QuicSession,
-    send: &AsyncMutex<S>,
-    local_write: &AsyncMutex<L>,
-    mut receipts: mpsc::Receiver<()>,
-) -> PumpExit
-where
-    S: AsyncWrite + Unpin,
-    L: AsyncWrite + Unpin,
-{
-    // Encoded once: the probe is the same frame every time, and the client's
-    // own pings pass through untouched, so a duplicate ping is harmless.
-    let ping = match health_ping_frame() {
-        Ok(ping) => ping,
-        Err(detail) => return PumpExit::Ended(detail),
-    };
-    let mut monitor = PathMonitor::new(Instant::now());
 
-    loop {
-        let deadline = tokio::time::Instant::from_std(monitor.next_deadline(Instant::now()));
-        tokio::select! {
-            receipt = receipts.recv() => {
-                if receipt.is_none() {
-                    return PumpExit::Ended("remote QUIC stream ended".to_owned());
-                }
-                if let Some(state) = monitor.received(Instant::now()) {
-                    info!(?state, "remote QUIC path recovered");
-                    if let Err(detail) = announce_transport_state(local_write, state).await {
-                        return PumpExit::Ended(detail);
-                    }
-                }
-            }
-            () = tokio::time::sleep_until(deadline) => {
-                let now = Instant::now();
-                let outcome = monitor.on_tick(now);
-                if outcome.probe {
-                    let write = {
-                        let mut send = send.lock().await;
-                        write_frame(&mut *send, &ping).await
-                    };
-                    if let Err(detail) = write {
-                        return PumpExit::Ended(detail);
-                    }
-                    monitor.probe_sent(now);
-                }
-                if outcome.rebind {
-                    match session.rebind() {
-                        Ok(()) => info!("remote QUIC socket rebound"),
-                        Err(detail) => debug!(%detail, "remote QUIC socket rebind failed"),
-                    }
-                }
-                match outcome.transition {
-                    Some(PathState::Lost) => {
-                        return PumpExit::Ended(format!(
-                            "remote QUIC path was silent for more than {} s",
-                            ROAMING_GRACE.as_secs()
-                        ));
-                    }
-                    Some(state) => {
-                        info!(?state, "remote QUIC path silent; recovering");
-                        if let Err(detail) = announce_transport_state(local_write, state).await {
-                            return PumpExit::Ended(detail);
-                        }
-                    }
-                    None => {}
-                }
-            }
-        }
-    }
+/// The bridge's own liveness probe. Upstream's health ping is a plain endpoint
+/// control frame, so the server answers it without knowing a bridge exists.
+fn health_ping_frame() -> Result<Vec<u8>, String> {
+    encode_frame(&ClientMessage::EndpointControl {
+        kind: HEALTH_PING_KIND.to_owned(),
+        data: String::new(),
+    })
 }
 
-async fn wait_for_stop(should_stop: &AtomicBool) {
-    while !should_stop.load(Ordering::Acquire) {
-        tokio::time::sleep(SHUTDOWN_POLL).await;
-    }
+fn encode_frame<M: Serialize>(message: &M) -> Result<Vec<u8>, String> {
+    bincode::serde::encode_to_vec(message, bincode::config::standard())
+        .map_err(|err| format!("failed to encode a bridge frame: {err}"))
 }
-
-/// Inject the local-only transport status hint toward the thin client. It never
-/// crosses the server API, so it is written straight into the local socket.
-async fn announce_transport_state<W>(
-    local_write: &AsyncMutex<W>,
-    state: PathState,
-) -> Result<(), String>
-where
-    W: AsyncWrite + Unpin,
-{
-    let Some(state) = transport_state_name(state) else {
-        return Ok(());
-    };
-    let frame = transport_status_frame(state)?;
-    let mut writer = local_write.lock().await;
-    write_frame(&mut *writer, &frame).await
-}
-
 fn transport_state_name(state: PathState) -> Option<&'static str> {
     match state {
         PathState::Live => Some(TRANSPORT_STATE_LIVE),
@@ -867,20 +895,6 @@ fn transport_status_frame(state: &str) -> Result<Vec<u8>, String> {
         kind: TRANSPORT_STATUS_KIND.to_owned(),
         data: format!(r#"{{"state":"{state}"}}"#),
     })
-}
-
-/// The bridge's own liveness probe. Upstream's health ping is a plain endpoint
-/// control frame, so the server answers it without knowing a bridge exists.
-fn health_ping_frame() -> Result<Vec<u8>, String> {
-    encode_frame(&ClientMessage::EndpointControl {
-        kind: HEALTH_PING_KIND.to_owned(),
-        data: String::new(),
-    })
-}
-
-fn encode_frame<M: Serialize>(message: &M) -> Result<Vec<u8>, String> {
-    bincode::serde::encode_to_vec(message, bincode::config::standard())
-        .map_err(|err| format!("failed to encode a bridge frame: {err}"))
 }
 
 /// Take the accepted local socket as a std `UnixStream` so the pump can hand it
@@ -1604,6 +1618,96 @@ mod tests {
             );
             assert_eq!(&payload, expected);
         }
+    }
+    /// Regression for the mosh bug: a second local client through the same
+    /// bridge must ride a new stream on the one live QUIC connection, not dial
+    /// a second connection whose generation fences the first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_local_clients_share_one_quic_connection() {
+        use crate::server::remote_quic::RemoteQuicServer;
+        use std::net::{Ipv4Addr, UdpSocket};
+
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind port probe");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+        let config = crate::config::RemoteConfig {
+            quic_port_range: format!("{port}-{port}"),
+            ..Default::default()
+        };
+        let (accepted_tx, mut accepted) = mpsc::unbounded_channel();
+        let sink: crate::server::remote_quic::AcceptedClientSink = Arc::new(move |stream| {
+            let _ = accepted_tx.send(stream);
+        });
+        let server =
+            RemoteQuicServer::start(&config, "mux-test".to_owned(), sink).expect("QUIC server");
+
+        let record = server
+            .bootstrap(&crate::protocol::RemoteBootstrapRequest {
+                session: "mux-test".to_owned(),
+                logical_client_id: [5; REMOTE_QUIC_ID_BYTES],
+            })
+            .expect("mint capability");
+
+        let bridge_config = QuicBridgeConfig {
+            target: "mux-test-target".to_owned(),
+            remote_herdr: RemoteHerdr::for_test_binary(std::path::Path::new("/nonexistent")),
+            session: "mux-test".to_owned(),
+            ssh_options: None,
+            noninteractive: true,
+            transport: RemoteTransportConfig::Auto,
+            logical_client_id: [5; REMOTE_QUIC_ID_BYTES],
+        };
+        seed_credential_for_test(
+            &bridge_config,
+            record,
+            vec![SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))],
+        );
+
+        let local_socket =
+            std::env::temp_dir().join(format!("herdr-mux-test-{}.sock", std::process::id()));
+        let bridge = QuicBridge::start(bridge_config, local_socket.clone()).expect("bridge");
+
+        let handshake = |index: u8| {
+            let path = local_socket.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut client = std::os::unix::net::UnixStream::connect(&path)
+                    .expect("connect to bridge socket");
+                client
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout");
+                let hello = ClientMessage::TerminalHello {
+                    version: crate::protocol::PROTOCOL_VERSION,
+                    cols: 80,
+                    rows: 24,
+                    cell_width_px: 8,
+                    cell_height_px: 16,
+                    pixel_mouse: false,
+                };
+                crate::protocol::write_message(&mut client, &hello).expect("write hello");
+                let _: u8 = index;
+                client
+            })
+        };
+
+        let first = handshake(1).await.expect("first client connect task");
+        let second = handshake(2).await.expect("second client connect task");
+
+        // The server handed its acceptor one socket per client, and the
+        // second connection never fenced the first: both pipes stay readable
+        // for the whole lifetime of the shared connection.
+        let mut sockets = Vec::new();
+        for _ in 0..2 {
+            let stream = tokio::time::timeout(Duration::from_secs(10), accepted.recv())
+                .await
+                .expect("the sink is handed a client socket")
+                .expect("sink channel open");
+            sockets.push(stream);
+        }
+        drop(first);
+        drop(second);
+        drop(bridge);
+        drop(server);
+        let _ = std::fs::remove_file(&local_socket);
     }
 
     #[tokio::test]
