@@ -473,12 +473,27 @@ impl QuicSession {
         }
     }
 
+    /// Opens one data stream on the shared connection. The control stream
+    /// returned by `connect` stays with the bridge manager; a data stream
+    /// ends only this client, never the connection.
+    pub(crate) async fn open_bi(&self) -> Result<(SendStream, RecvStream), String> {
+        self.connection
+            .open_bi()
+            .await
+            .map_err(|err| format!("failed to open remote QUIC data stream: {err}"))
+    }
+
+    /// Whether the connection has already ended, so the manager dials a new
+    /// one instead of handing out streams on a dead session.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
+
     /// Migrates the connection to a freshly bound local socket, which is the
     /// only way to follow a local address change (sleep, tether, roam).
     pub(crate) fn rebind(&self) -> Result<(), String> {
         rebind_endpoint(&self.endpoint, self.remote_ip)
     }
-
     /// Resolves when the connection ends, classifying what the bridge may do.
     pub(crate) async fn closed(&self) -> SessionExit {
         classify_close(&self.connection.closed().await)
