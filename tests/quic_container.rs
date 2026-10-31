@@ -20,11 +20,11 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncBuilder;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericBuildableImage};
+use testcontainers::{GenericBuildableImage, ImageExt};
 
 mod support;
 
-const CONTAINER_QUIC_PORT: u16 = 48_100;
+const CONTAINER_QUIC_PORT: u16 = 48_000;
 
 fn unique_dir(prefix: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -39,7 +39,7 @@ fn timed_client_attach(
     home: &Path,
     config_home: &Path,
     state_home: &Path,
-) -> (Duration, Box<dyn MasterPty + Send>, Box<dyn portable_pty::Child + Send + Sync>) {
+) -> (Duration, Box<dyn MasterPty + Send>, Box<dyn portable_pty::Child + Send + Sync>, mpsc::Receiver<Vec<u8>>) {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -80,20 +80,28 @@ fn timed_client_attach(
         }
     });
 
-    let mut received = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while received < 2000 {
+    let mut received = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while received.len() < 2000 {
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(chunk) => received += chunk.len(),
+            Ok(chunk) => received.extend_from_slice(&chunk),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        assert!(
-            Instant::now() < deadline,
-            "client never rendered; received {received} bytes"
-        );
+        if Instant::now() >= deadline {
+            panic!(
+                "client never rendered; received {} bytes:\n{}",
+                received.len(),
+                String::from_utf8_lossy(&received)
+            );
+        }
     }
-    (started.elapsed(), pair.master, child)
+    eprintln!(
+        "[quic-container] timed_client_attach finished with received={} bytes:\n{}",
+        received.len(),
+        String::from_utf8_lossy(&received)
+    );
+    (started.elapsed(), pair.master, child, rx)
 }
 
 /// Detach a running remote client: SIGINT its child, mirroring the clean
@@ -111,9 +119,18 @@ fn detach(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
     panic!("client did not exit after SIGINT");
 }
 
+struct ImageCleanupGuard(&'static str);
+impl Drop for ImageCleanupGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("docker").args(["rmi", "-f", self.0]).output();
+        let _ = Command::new("docker").args(["image", "prune", "-f"]).output();
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs a container engine (podman/docker) and a built debug binary"]
 async fn persisted_bridge_speeds_up_reattach_over_real_ssh() {
+    let _image_guard = ImageCleanupGuard("herdr-quic-test:latest");
     let base = unique_dir("quic-ctr");
     fs::create_dir_all(&base).expect("create base");
 
@@ -134,7 +151,14 @@ async fn persisted_bridge_speeds_up_reattach_over_real_ssh() {
         .join("target/debug/herdr");
     assert!(herdr.is_file(), "build herdr first: {}", herdr.display());
 
-    let dockerfile = r#"FROM docker.io/library/debian:bookworm-slim
+    let staged_herdr = base.join("herdr");
+    fs::copy(&herdr, &staged_herdr).expect("copy herdr to staging");
+    let _ = Command::new("patchelf")
+        .args(["--set-interpreter", "/lib64/ld-linux-x86-64.so.2", "--set-rpath", "/lib:/usr/lib"])
+        .arg(&staged_herdr)
+        .status();
+
+    let dockerfile = r#"FROM docker.io/library/debian:sid-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssh-server \
     && rm -rf /var/lib/apt/lists/*
@@ -144,6 +168,7 @@ RUN chmod 700 /root/.ssh \
     && chmod 600 /root/.ssh/authorized_keys \
     && sed -i 's/^#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 COPY herdr /usr/local/bin/herdr
+RUN chmod +x /usr/local/bin/herdr
 EXPOSE 22
 CMD ["/usr/sbin/sshd", "-D", "-e"]
 "#
@@ -151,31 +176,29 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
 
     let image = GenericBuildableImage::new("herdr-quic-test", "latest")
         .with_dockerfile_string(dockerfile)
-        .with_file(&herdr, "./herdr")
+        .with_file(&staged_herdr, "./herdr")
         .with_data(pubkey, "./authorized_keys")
         .build_image()
         .await
         .expect("build the ssh+herdr image");
 
+    let ssh_host_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("find free port");
+        listener.local_addr().expect("port").port()
+    };
     let container = image
-        .with_exposed_port(22.tcp())
-        .with_exposed_port(CONTAINER_QUIC_PORT.udp())
         .with_wait_for(WaitFor::message_on_either_std("Server listening"))
+        .with_mapped_port(ssh_host_port, 22.tcp())
+        .with_mapped_port(CONTAINER_QUIC_PORT, CONTAINER_QUIC_PORT.udp())
         .start()
         .await
         .expect("start the ssh+herdr container");
 
     let host = container.get_host().await.expect("container host");
-    let ssh_port = container
-        .get_host_port_ipv4(22.tcp())
-        .await
-        .expect("mapped ssh port");
-    let _quic_port = container
-        .get_host_port_ipv4(CONTAINER_QUIC_PORT.udp())
-        .await
-        .expect("mapped quic port");
+    let ssh_port = ssh_host_port;
 
-    let ssh_target = format!("root@{host}:{ssh_port}");
+    let host_alias = "herdr-test-box";
+    let ssh_target = host_alias.to_string();
     eprintln!("[quic-container] ssh target: {ssh_target}");
 
     let config_home = base.join("config");
@@ -192,30 +215,77 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
     // ~/.ssh/config, so point HOME's config at the key through a stub.
     let home = base.join("home");
     fs::create_dir_all(home.join(".ssh")).unwrap();
-    fs::copy(&identity, home.join(".ssh/id_ed25519")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&identity, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(home.join(".ssh"), fs::Permissions::from_mode(0o700));
+    }
+    let id_str = identity.display();
     fs::write(
         home.join(".ssh/config"),
-        format!("Host {host}\n  User root\n  Port {ssh_port}\n  IdentityFile ~/.ssh/id_ed25519\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n"),
+        format!("Host {host_alias}\n  HostName {host}\n  User root\n  Port {ssh_port}\n  IdentityFile {id_str}\n  IdentitiesOnly yes\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n"),
     )
     .unwrap();
 
     // First (cold) attach: real SSH discovery, real bootstrap, real QUIC.
-    let (cold, _cold_master, mut cold_child) =
+    let (cold, _cold_master, mut cold_child, cold_rx) =
         timed_client_attach(&ssh_target, &home, &config_home, &state_home);
     eprintln!("[quic-container] cold attach: {cold:?}");
+    let cold_status_immediate = cold_child.try_wait().expect("cold status immediate");
+    eprintln!("[quic-container] cold client status immediately after timed_client_attach: {cold_status_immediate:?}");
 
+    let (concurrent, _concurrent_master, mut concurrent_child, _concurrent_rx) =
+        timed_client_attach(&ssh_target, &home, &config_home, &state_home);
+    eprintln!("[quic-container] concurrent attach: {concurrent:?}");
+    let concurrent_status = concurrent_child.try_wait().expect("concurrent status");
+    eprintln!("[quic-container] concurrent client status immediately after timed_client_attach: {concurrent_status:?}");
+    let cold_status = cold_child.try_wait().expect("cold status");
+    eprintln!("[quic-container] cold client status: {cold_status:?}");
+    if cold_status.is_some() {
+        let mut cold_output = Vec::new();
+        while let Ok(chunk) = cold_rx.try_recv() {
+            cold_output.extend_from_slice(&chunk);
+        }
+        eprintln!("[quic-container] cold output:\n{}", String::from_utf8_lossy(&cold_output));
+        fn dump_logs(dir: &Path) {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        dump_logs(&path);
+                    } else if path.extension().is_some_and(|e| e == "log") {
+                        if let Ok(c) = fs::read_to_string(&path) {
+                            eprintln!("[quic-container] log at {}:\n{c}", path.display());
+                        }
+                    }
+                }
+            }
+        }
+        dump_logs(&base);
+    }
+    assert!(
+        cold_status.is_none(),
+        "first client must not be killed or fenced by the second client"
+    );
+    assert!(
+        concurrent_child.try_wait().expect("concurrent status").is_none(),
+        "second client must be running healthy alongside the first"
+    );
+
+    detach(&mut concurrent_child);
     detach(&mut cold_child);
 
     // Give the launcher a moment to persist before the warm attach.
     thread::sleep(Duration::from_millis(500));
-    let (warm, _warm_master, mut warm_child) =
+    let (warm, _warm_master, mut warm_child, _warm_rx) =
         timed_client_attach(&ssh_target, &home, &config_home, &state_home);
     eprintln!("[quic-container] warm attach: {warm:?}");
 
-    eprintln!("cold: {cold:?}, warm: {warm:?}");
+    eprintln!("cold: {cold:?}, concurrent: {concurrent:?}, warm: {warm:?}");
     assert!(
         warm < cold,
         "warm attach ({warm:?}) must be faster than cold ({cold:?})"
     );
-    let _ = &mut warm_child;
+    detach(&mut warm_child);
 }
