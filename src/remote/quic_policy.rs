@@ -27,9 +27,10 @@ pub(crate) const REMOTE_QUIC_CLOSE_SHUTDOWN: u32 = 0x103;
 /// client reconnects with the credential it already holds; bootstrapping again
 /// would be pointless work during an update.
 pub(crate) const REMOTE_QUIC_CLOSE_HANDOFF: u32 = 0x104;
-/// The server-side client connection ended (the server's client acceptor
-/// closed its end of the pipe). The credential is still valid, so the client
-/// reconnects with the one it holds.
+/// A client stream ended on a multiplexed connection. Kept for wire
+/// compatibility with single-stream peers; a multiplexing server closes
+/// only the stream, so it no longer sends this on the connection.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const REMOTE_QUIC_CLOSE_RESYNC: u32 = 0x105;
 /// The capability itself was evicted from the server's token table (overflow),
 /// so the credential the client holds no longer resolves to anything. Retrying
