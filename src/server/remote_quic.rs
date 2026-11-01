@@ -665,20 +665,32 @@ async fn serve_connection(connection: Connection, state: Arc<ServerState>) -> Re
 }
 
 /// Reads the hello stream's halves open so the bridge's health pings keep a
-/// reader on the other side; the frames themselves stay opaque here.
+/// reader on the other side. A health ping is answered with a pong: the bridge
+/// measures path liveness from these replies. Anything else stays opaque and
+/// is discarded so it does not fill the stream's receive buffer; the send half
+/// is held open so the bridge never sees the liveness channel close.
 async fn drain_control_stream(
     mut send: SendStream,
     mut recv: RecvStream,
 ) -> Result<(), String> {
-    // Any bytes here are opaque endpoint control frames. Read and discard
-    // them so they do not fill the stream's receive buffer; the send half is
-    // held open so the bridge never sees the liveness channel close.
-    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
-    let _ = &mut send;
     loop {
-        match recv.read(&mut buffer).await {
-            Ok(Some(_read)) => {}
-            _ => return Ok(()),
+        let control: Result<crate::protocol::ClientMessage, String> =
+            read_async_message(&mut recv, MAX_HELLO_SIZE).await;
+        let message = match control {
+            Ok(message) => message,
+            Err(detail) => {
+                // The bridge closes the stream when the pump ends; the peer
+                // sending garbage on the liveness channel ends the same way.
+                debug!(%detail, "remote QUIC control stream ended");
+                return Ok(());
+            }
+        };
+        if let crate::protocol::ClientMessage::EndpointControl { kind, data } = message {
+            if let Some(pong) = crate::server::client_endpoint_control::response(&kind, data) {
+                if let Err(detail) = write_async_message(&mut send, &pong, MAX_FRAME_SIZE).await {
+                    return Err(detail);
+                }
+            }
         }
     }
 }
@@ -1351,6 +1363,38 @@ mod tests {
             .expect("pong arrives")
             .expect("read pong");
         assert_eq!(&pong, b"pong");
+    }
+
+    /// The hello stream doubles as the liveness channel: a health ping written
+    /// there must be answered with a pong, or the bridge's PathMonitor sees
+    /// silence and tears the connection down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_health_ping_on_the_hello_stream_is_answered_with_a_pong() {
+        let TestServer {
+            server,
+            accepted,
+        } = test_server_on_free_port();
+        drop(accepted);
+        let record = mint(&server, 41);
+        let mut client = dial_with_hello(&record, 41, 1).await;
+        let _accepted: RemoteQuicAccepted =
+            read_async_message(&mut client.recv, MAX_HELLO_SIZE)
+                .await
+                .expect("read accepted");
+        let ping = crate::protocol::ClientMessage::EndpointControl {
+            kind: crate::protocol::endpoint::HEALTH_PING_KIND.to_owned(),
+            data: String::new(),
+        };
+        write_async_message(&mut client.send, &ping, MAX_FRAME_SIZE)
+            .await
+            .expect("write health ping");
+        let pong: Result<crate::protocol::ServerMessage, String> =
+            read_async_message(&mut client.recv, MAX_FRAME_SIZE).await;
+        match pong {
+            Ok(crate::protocol::ServerMessage::EndpointControl { kind, .. })
+                if kind == crate::protocol::endpoint::HEALTH_PONG_KIND => {}
+            other => panic!("expected a health pong, got {other:?}"),
+        }
     }
 
     /// A roamed client re-dials with the next generation of the same
