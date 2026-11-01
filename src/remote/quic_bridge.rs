@@ -137,12 +137,34 @@ pub(crate) struct QuicBridge {
     thread: Option<JoinHandle<()>>,
 }
 
-/// A persisted bridge exits once no local client has attached for this long,
-/// mirroring SSH `ControlPersist`. Zero (the default) means never idle out.
+/// A persisted bridge exits once no local client attached or relayed a frame
+/// for this long, mirroring SSH `ControlPersist`. Zero (the default) means
+/// never idle out.
 const PERSISTED_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Unix seconds of the last accepted connection or relayed frame. A
+/// multiplexed long-lived client keeps refreshing this, so the watchdog sees
+/// traffic, not just new attaches.
+static LAST_ACTIVITY_UNIX_SECS: AtomicU64 = AtomicU64::new(0);
+
+fn note_activity() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    LAST_ACTIVITY_UNIX_SECS.fetch_max(now, Ordering::Release);
+}
+
+fn idle_secs() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(LAST_ACTIVITY_UNIX_SECS.load(Ordering::Acquire))
+}
+
 impl QuicBridge {
-    /// Arm the idle watchdog: exit once no local client attaches for the
+    /// Arm the idle watchdog: exit once no local client has attached for the
     /// persist window (SSH `ControlPersist` semantics).
     pub(crate) fn persist_when_idle(&self) {
         self.idle_timeout_secs
@@ -178,11 +200,11 @@ impl QuicBridge {
         let thread_stop = Arc::clone(&should_stop);
         let thread_idle = Arc::clone(&idle_timeout_secs);
         let thread = thread::spawn(move || {
-            let mut idle_since = Instant::now();
+            note_activity();
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok(mut stream) => {
-                        idle_since = Instant::now();
+                        note_activity();
                         if let Err(err) = crate::ipc::set_local_stream_polling(&mut stream, false) {
                             tracing::error!(
                                 error = %err,
@@ -198,12 +220,12 @@ impl QuicBridge {
                         thread::sleep(ACCEPT_POLL);
                         let timeout_secs = thread_idle.load(Ordering::Acquire);
                         if timeout_secs > 0
-                            && idle_since.elapsed()
-                                >= Duration::from_secs(timeout_secs).min(PERSISTED_IDLE_TIMEOUT)
+                            && idle_secs()
+                                >= timeout_secs.min(PERSISTED_IDLE_TIMEOUT.as_secs())
                         {
                             // This is the only thread that observes idle;
                             // exit the process so the parked main thread and
-                            // Drop's socket cleanup happen deterministically.
+                            // Drop's socket cleanup follow it deterministically.
                             info!("persisted remote bridge idled out");
                             std::process::exit(0);
                         }
@@ -645,6 +667,7 @@ async fn run_control_pump(
                         return;
                     }
                     monitor.probe_sent(now);
+                    note_activity();
                 }
                 if outcome.rebind {
                     match session.rebind() {
@@ -811,6 +834,7 @@ where
         if !read_frame(reader, max, &mut payload).await? {
             return Ok(());
         }
+        note_activity();
         if let Some(receipts) = &receipts {
             let _ = receipts.try_send(());
         }
