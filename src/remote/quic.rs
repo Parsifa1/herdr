@@ -557,6 +557,18 @@ async fn handshake(
         })?;
     let connection = match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
         Ok(Ok(connection)) => connection,
+        // A fatal TLS alert during the handshake means the verifier refused
+        // the server's certificate: it is no longer the one the bootstrap
+        // pinned, so the server process was replaced and the cached token
+        // died with it.
+        Ok(Err(quinn::ConnectionError::TransportError(transport_error)))
+            if transport_error.code
+                == quinn::TransportErrorCode::crypto(0x28) =>
+        {
+            return Err(ConnectError::Rejected(SessionExit::Rebootstrap(format!(
+                "{candidate}: {transport_error}"
+            ))))
+        }
         Ok(Err(err)) => return Err(ConnectError::Other(format!("{candidate}: {err}"))),
         Err(_) => {
             return Err(ConnectError::Timeout(format!(
@@ -1329,9 +1341,15 @@ mod tests {
         })
         .await
         .expect_err("an unpinned certificate must not be accepted");
+        // A fingerprint mismatch is the server presenting a different
+        // certificate than the bootstrap pinned: the server process was
+        // replaced, so the credential died with it.
         assert!(
-            matches!(error, ConnectError::Other(_)),
-            "a rejected certificate is a path failure, not a credential verdict: {error}"
+            matches!(
+                error,
+                ConnectError::Rejected(SessionExit::Rebootstrap(_))
+            ),
+            "a fingerprint mismatch must retire the credential: {error}"
         );
     }
 
