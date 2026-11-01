@@ -441,6 +441,10 @@ impl HeadlessServer {
                 let _ = quit_notify.try_send(ServerEvent::QuitSignal);
             },
         );
+        #[cfg(unix)]
+        if let Err(err) = self.ensure_remote_quic() {
+            warn!(%err, "remote QUIC endpoint unavailable; remote clients fall back to SSH");
+        }
 
         let mut needs_render = true;
         let mut needs_full_render = true;
@@ -2749,22 +2753,33 @@ impl HeadlessServer {
         if self.remote_config.transport == crate::config::RemoteTransportConfig::Ssh {
             return Err("remote.transport is set to ssh on the server".to_owned());
         }
-        if self.remote_quic.is_none() {
-            let sink = self.remote_quic_sink();
-            let server = crate::server::remote_quic::RemoteQuicServer::start(
-                &self.remote_config,
-                crate::session::active_name()
-                    .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned()),
-                sink,
-            )
-            .map_err(|err| format!("failed to start remote QUIC endpoint: {err}"))?;
-            info!(port = server.port(), "remote QUIC endpoint listening");
-            self.remote_quic = Some(server);
-        }
+        self.ensure_remote_quic()?;
         let Some(server) = self.remote_quic.as_ref() else {
             return Err("remote QUIC endpoint unavailable".to_owned());
         };
         server.bootstrap(request)
+    }
+
+    /// Bind the QUIC endpoint when the server wants remote traffic. Without
+    /// this, a restarted server waits for a bootstrap that a bridge holding a
+    /// cached credential never sends: its dials time out instead of being
+    /// rejected, so the credential stays and the port never opens.
+    #[cfg(unix)]
+    fn ensure_remote_quic(&mut self) -> Result<(), String> {
+        if self.remote_quic.is_some() || self.remote_config.transport == crate::config::RemoteTransportConfig::Ssh {
+            return Ok(());
+        }
+        let sink = self.remote_quic_sink();
+        let server = crate::server::remote_quic::RemoteQuicServer::start(
+            &self.remote_config,
+            crate::session::active_name()
+                .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned()),
+            sink,
+        )
+        .map_err(|err| format!("failed to start remote QUIC endpoint: {err}"))?;
+        info!(port = server.port(), "remote QUIC endpoint listening");
+        self.remote_quic = Some(server);
+        Ok(())
     }
 
     fn agent_read_not_idle_error(

@@ -364,6 +364,32 @@ fn remote_bootstrap_is_refused_while_transport_is_ssh() {
     shutdown_test_runtimes(&mut server);
 }
 
+/// A restarted server must bind the QUIC endpoint at startup when transport
+/// is auto. Waiting for the first bootstrap deadlocks: a bridge holding a
+/// cached credential never sends one, its dials time out instead of being
+/// rejected, and the port never opens.
+#[cfg(unix)]
+#[tokio::test]
+async fn remote_quic_endpoint_is_bound_at_startup_under_auto_transport() {
+    let mut server = test_headless_server();
+    server.ensure_remote_quic().expect("endpoint starts");
+    let quic = server.remote_quic.as_ref().expect("endpoint is live");
+    let port = quic.port();
+    assert!((48000..=48100).contains(&port), "port {port} must come from the default range");
+    shutdown_test_runtimes(&mut server);
+}
+
+/// The ssh transport opts out of QUIC entirely, so startup must not bind.
+#[cfg(unix)]
+#[test]
+fn remote_quic_endpoint_stays_unbound_under_ssh_transport() {
+    let mut server = test_headless_server();
+    server.remote_config.transport = crate::config::RemoteTransportConfig::Ssh;
+    server.ensure_remote_quic().expect("ssh is a no-op, not an error");
+    assert!(server.remote_quic.is_none());
+    shutdown_test_runtimes(&mut server);
+}
+
 #[test]
 fn headless_api_request_drains_all_pending_internal_events_before_reading_state() {
     let mut server = test_headless_server();
