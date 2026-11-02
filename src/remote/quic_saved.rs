@@ -148,7 +148,8 @@ pub(crate) fn run_remote_bridge_daemon(args: &[String]) -> io::Result<()> {
         },
         path,
     )?;
-    bridge.persist_when_idle();
+    let idle_timeout = crate::config::Config::load().config.remote.bridge_idle_timeout_seconds;
+    bridge.persist_when_idle(idle_timeout);
 
     // Park the main thread; the bridge's accept thread exits the process on
     // idle and Drop's socket cleanup follows it.

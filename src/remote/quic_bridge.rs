@@ -20,7 +20,7 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -133,18 +133,30 @@ pub(crate) struct QuicBridge {
     local_socket: PathBuf,
     socket_identity: crate::ipc::SocketFileIdentity,
     should_stop: Arc<AtomicBool>,
-    idle_timeout_secs: Arc<AtomicU64>,
+    idle_timeout_secs: Arc<AtomicI64>,
     thread: Option<JoinHandle<()>>,
 }
 
-/// A persisted bridge exits once no local client attached or relayed a frame
-/// for this long, mirroring SSH `ControlPersist`. Zero (the default) means
-/// never idle out.
-const PERSISTED_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Count of locally attached clients currently streaming through this bridge.
+/// A bridge with active clients never idles out.
+static ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 
-/// Unix seconds of the last accepted connection or relayed frame. A
-/// multiplexed long-lived client keeps refreshing this, so the watchdog sees
-/// traffic, not just new attaches.
+struct ClientGuard;
+impl ClientGuard {
+    fn new() -> Self {
+        ACTIVE_CLIENTS.fetch_add(1, Ordering::Release);
+        note_activity();
+        Self
+    }
+}
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        ACTIVE_CLIENTS.fetch_sub(1, Ordering::Release);
+        note_activity();
+    }
+}
+
+/// Unix seconds of the last accepted connection, client disconnection, or relayed frame.
 static LAST_ACTIVITY_UNIX_SECS: AtomicU64 = AtomicU64::new(0);
 
 fn note_activity() {
@@ -165,12 +177,11 @@ fn idle_secs() -> u64 {
 
 impl QuicBridge {
     /// Arm the idle watchdog: exit once no local client has attached for the
-    /// persist window (SSH `ControlPersist` semantics).
-    pub(crate) fn persist_when_idle(&self) {
+    /// configured seconds (-1 means never idle out).
+    pub(crate) fn persist_when_idle(&self, timeout_secs: i64) {
         self.idle_timeout_secs
-            .store(PERSISTED_IDLE_TIMEOUT.as_secs(), Ordering::Release);
+            .store(timeout_secs, Ordering::Release);
     }
-
     pub(crate) fn start(config: QuicBridgeConfig, local_socket: PathBuf) -> io::Result<Self> {
         crate::ipc::prepare_socket_path(&local_socket, |path| {
             format!("remote bridge is already listening at {}", path.display())
@@ -190,7 +201,7 @@ impl QuicBridge {
 
         let config = Arc::new(config);
         let should_stop = Arc::new(AtomicBool::new(false));
-        let idle_timeout_secs = Arc::new(AtomicU64::new(0));
+        let idle_timeout_secs = Arc::new(AtomicI64::new(0));
         let (client_tx, client_rx) = mpsc::unbounded_channel::<crate::ipc::LocalStream>();
         let manager_config = Arc::clone(&config);
         let manager_stop = Arc::clone(&should_stop);
@@ -220,8 +231,8 @@ impl QuicBridge {
                         thread::sleep(ACCEPT_POLL);
                         let timeout_secs = thread_idle.load(Ordering::Acquire);
                         if timeout_secs > 0
-                            && idle_secs()
-                                >= timeout_secs.min(PERSISTED_IDLE_TIMEOUT.as_secs())
+                            && ACTIVE_CLIENTS.load(Ordering::Acquire) == 0
+                            && idle_secs() >= timeout_secs as u64
                         {
                             // This is the only thread that observes idle;
                             // exit the process so the parked main thread and
@@ -463,9 +474,9 @@ fn run_bridge_manager(
             }
             Acquired::Stopped => break,
         };
-
         let states = states_tx.subscribe();
         runtime.spawn(async move {
+            let _guard = ClientGuard::new();
             let (send, recv) = match session.open_bi().await {
                 Ok(pair) => pair,
                 Err(detail) => {
@@ -667,7 +678,6 @@ async fn run_control_pump(
                         return;
                     }
                     monitor.probe_sent(now);
-                    note_activity();
                 }
                 if outcome.rebind {
                     match session.rebind() {
@@ -701,8 +711,8 @@ fn carry_on_ssh(
     config: &Arc<QuicBridgeConfig>,
     should_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
+    let _guard = ClientGuard::new();
     info!(
-        target = %config.target,
         "carrying the remote client on the SSH stdio bridge"
     );
     let remote_command = config.remote_herdr.bridge_command(&config.session);

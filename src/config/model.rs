@@ -1083,6 +1083,10 @@ pub struct RemoteConfig {
     /// it dead. Default: 180 seconds, longer than the client's 150 s roaming
     /// grace so a tunnel-length blackhole migrates instead of reconnecting.
     pub quic_transport_idle_timeout_seconds: u64,
+    /// How long an idle remote bridge daemon stays alive without any attached
+    /// clients before exiting. Set to -1 for never idle out (always persist).
+    /// Default: 600 seconds.
+    pub bridge_idle_timeout_seconds: i64,
 }
 
 impl Default for RemoteConfig {
@@ -1093,6 +1097,7 @@ impl Default for RemoteConfig {
             quic_port_range: "48000-48100".to_owned(),
             quic_idle_timeout_seconds: 86_400,
             quic_transport_idle_timeout_seconds: 180,
+            bridge_idle_timeout_seconds: 600,
         }
     }
 }
