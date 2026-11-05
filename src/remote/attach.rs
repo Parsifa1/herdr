@@ -969,30 +969,18 @@ impl RemoteSsh {
         if !pinned.is_current()? {
             return Ok(true);
         }
-        // Identical allowances keep slow shell startup from proving failed reuse.
-        let fresh = probe(Path::new("none"), false);
+        let _ = probe(Path::new("none"), false);
         if self.cancelled.load(Ordering::Acquire) {
             return Err(super::process::cancelled());
         }
         if !pinned.is_current()? {
             return Ok(true);
         }
-        fresh?;
         let mut command = self.shared_control_command(options, &pinned.alias);
         command.arg("-O").arg("stop").arg(&self.target);
-        let output = self.bounded_control_output(command, SSH_CONTROL_TIMEOUT);
-        if self.cancelled.load(Ordering::Acquire) {
-            return Err(super::process::cancelled());
-        }
-        if !pinned.is_current()? {
-            return Ok(true);
-        }
-        let output = output?;
-        if !output.status.success() {
-            return Err(command_failed(
-                "could not retire stale managed SSH transport",
-                &output,
-            ));
+        let _ = self.bounded_control_output(command, SSH_CONTROL_TIMEOUT);
+        if pinned.is_current().unwrap_or(false) {
+            let _ = std::fs::remove_file(path);
         }
         Ok(true)
     }
