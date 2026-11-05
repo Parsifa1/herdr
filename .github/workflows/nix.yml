@@ -50,6 +50,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -71,5 +72,16 @@ jobs:
           restore-keys: |
             target-${{ runner.os }}-
 
-      - name: Test
-        run: nix develop --command just test
+      - name: Unit and integration tests
+        run: >-
+          nix develop --command cargo nextest run --locked --no-fail-fast
+          --status-level fail --final-status-level slow
+          --failure-output final --success-output never
+
+      - name: Maintenance and asset contracts
+        if: always()
+        run: |
+          nix develop --command just maintenance-test
+          nix develop --command just ui-hot-path-architecture-test
+          nix develop --command just integration-assets-test
+          nix develop --command just docs-contract-test
