@@ -10,16 +10,25 @@ pub fn build_id() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_ID"))
 }
 
+/// The canonical version every machine-readable surface reports: the API
+/// `ping`, `status`, endpoint handshakes and the handoff fingerprint compare
+/// against it. The fork marker stays out of it, because a suffix there reads
+/// as a different release to every consumer that parses a version.
 pub fn version() -> String {
-    let suffix = match (build_commit(), channel()) {
-        (Some(commit), _) => format!(" (with quic, {commit})"),
-        (None, "stable") => " (with quic)".to_string(),
-        (None, channel) => match build_id() {
-            Some(build_id) => format!("-{channel}.{build_id}"),
-            None => format!("-{channel}"),
-        },
-    };
-    format!("{BASE_VERSION}{suffix}")
+    match (channel(), build_id()) {
+        ("stable", _) => BASE_VERSION.to_string(),
+        (channel, Some(build_id)) => format!("{BASE_VERSION}-{channel}.{build_id}"),
+        (channel, None) => format!("{BASE_VERSION}-{channel}"),
+    }
+}
+
+/// The human-facing `--version` line, which names this build's transport and
+/// the commit it was built from.
+pub fn display_version() -> String {
+    match build_commit() {
+        Some(commit) => format!("{} (with quic, {commit})", version()),
+        None => format!("{} (with quic)", version()),
+    }
 }
 
 fn build_commit() -> Option<&'static str> {
