@@ -88,11 +88,13 @@
           default = pkgs.mkShell {
             name = "herdr-dev";
             packages = with pkgs; [
+              bun
               cargo-nextest
               cmake
               just
               ninja
               pkg-config
+              python3
               rustToolchain
               zig_0_16
             ];
