@@ -1493,6 +1493,12 @@
           "type": "integer",
           "default": "180",
           "description": "How long a silent QUIC connection is kept before the server declares it dead (10-600). Keep it above the client's 150-second roaming grace so a long blackhole migrates instead of reconnecting."
+        },
+        {
+          "key": "remote.bridge_idle_timeout_seconds",
+          "type": "integer",
+          "default": "600",
+          "description": "How long a persisted remote bridge daemon stays alive after its last local client detaches, before exiting. Set -1 to keep it running until the machine restarts, so the next connection pays no handshake."
         }
       ]
     },
