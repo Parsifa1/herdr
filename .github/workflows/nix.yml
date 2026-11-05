@@ -74,7 +74,8 @@ jobs:
 
       - name: Unit and integration tests
         run: >-
-          nix develop --command cargo nextest run --locked --no-fail-fast
+          nix develop --command env LIBGHOSTTY_VT_OPTIMIZE=ReleaseSafe
+          cargo nextest run --locked --no-fail-fast
           --status-level fail --final-status-level slow
           --failure-output final --success-output never
 
