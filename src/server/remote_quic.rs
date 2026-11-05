@@ -31,6 +31,7 @@ use crate::remote::frame::{hash_bytes, lock, read_async_message, write_async_mes
 use crate::remote::quic_policy::{
     REMOTE_QUIC_CLOSE_AUTH, REMOTE_QUIC_CLOSE_EVICTED, REMOTE_QUIC_CLOSE_HANDOFF,
     REMOTE_QUIC_CLOSE_PROTOCOL, REMOTE_QUIC_CLOSE_REPLACED, REMOTE_QUIC_CLOSE_SHUTDOWN,
+    REMOTE_QUIC_INITIAL_CONGESTION_WINDOW, REMOTE_QUIC_INITIAL_RTT,
 };
 
 const MAX_TOKENS: usize = 64;
@@ -47,10 +48,18 @@ const TOKEN_MAX_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 // Flow-control caps, not allocations; see the client-side note in
 // src/remote/quic.rs. Sized for the render burst a graphics-heavy pane sends,
-// not for one high-latency link profile.
-const QUIC_SEND_WINDOW: u64 = 4 * 1024 * 1024;
+// not for one high-latency link profile. `QUIC_SEND_WINDOW` only seeds the
+// connection: `bound_unsent` lowers it before every write.
+const QUIC_SEND_WINDOW: u64 = 1024 * 1024;
 const QUIC_STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
 const QUIC_RECEIVE_WINDOW: u32 = 1024 * 1024;
+/// How much quinn may hold written but unsent past what the congestion window
+/// lets out, connection-wide. quinn counts written-but-unacknowledged bytes
+/// against its send window, so bound the window to `cwnd + this` and in-flight
+/// is at most cwnd: at most this much waits where nothing can reorder or drop
+/// it. Without it the window above lets a megabyte of screen output sit
+/// outside reach of any priority, and the next control frame queues behind it.
+const QUIC_LOWAT: u64 = 16 * 1024;
 /// Per-direction copy buffer for one adapted connection. Large enough that a
 /// multi-megabyte frame moves in a few syscalls, small enough that 32
 /// pre-auth connections cannot pin meaningful memory.
@@ -512,10 +521,18 @@ fn transport_config(idle_timeout: Duration) -> Result<quinn::TransportConfig, io
         .stream_receive_window(VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW))
         .receive_window(VarInt::from_u32(QUIC_RECEIVE_WINDOW))
         .send_window(QUIC_SEND_WINDOW)
+        .initial_rtt(REMOTE_QUIC_INITIAL_RTT)
         // See the matching note in src/remote/quic.rs: BBR paces to measured
         // bottleneck bandwidth, so random loss on a mobile path does not
-        // collapse the send window the way loss-based Cubic does.
-        .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        // collapse the send window the way loss-based Cubic does. Its initial
+        // window is overridden for the same reason as there: quinn's BBR
+        // starts at 200 packets, and the server's first burst is a full-screen
+        // repaint.
+        .congestion_controller_factory(Arc::new({
+            let mut bbr = quinn::congestion::BbrConfig::default();
+            bbr.initial_window(REMOTE_QUIC_INITIAL_CONGESTION_WINDOW);
+            bbr
+        }));
     Ok(transport)
 }
 
@@ -653,8 +670,11 @@ async fn serve_connection(connection: Connection, state: Arc<ServerState>) -> Re
             Err(_) => break,
         };
         let state = Arc::clone(&state);
+        let stream_connection = connection.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve_client_stream(stream_send, stream_recv, &state).await {
+            if let Err(err) =
+                serve_client_stream(stream_send, stream_recv, &stream_connection, &state).await
+            {
                 debug!(%err, "remote QUIC client stream ended");
             }
         });
@@ -729,6 +749,7 @@ async fn accept_hello(
 async fn serve_client_stream(
     mut send: SendStream,
     recv: RecvStream,
+    connection: &Connection,
     state: &ServerState,
 ) -> Result<(), String> {
     let (adapter_end, client_end) = tokio::net::UnixStream::pair()
@@ -743,13 +764,13 @@ async fn serve_client_stream(
     (state.sink)(client_end);
     let (local_read, local_write) = adapter_end.into_split();
     tokio::select! {
-        result = copy_stream(local_read, &mut send) => {
+        result = copy_stream(local_read, &mut send, Some(connection)) => {
             // The acceptor closed its end: this client's session is over as
             // far as the server is concerned, but the capability and the
             // connection stay good for the next stream.
             result.map_err(|err| format!("remote QUIC uplink failed: {err}"))
         }
-        result = copy_stream(recv, local_write) => {
+        result = copy_stream(recv, local_write, None) => {
             // The QUIC side ended; dropping the pair end hands the acceptor an
             // EOF, which is exactly what a local client disconnect looks like.
             result.map_err(|err| format!("remote QUIC downlink failed: {err}"))
@@ -757,15 +778,28 @@ async fn serve_client_stream(
     }
 }
 
+/// Keeps quinn's unsent backlog at [`QUIC_LOWAT`] past what the congestion
+/// window lets out. Refreshed before every write so it follows cwnd as
+/// acknowledgments arrive, which is what keeps a large frame from parking
+/// itself in quinn's buffer where CREDIT, priorities and cancellation cannot
+/// reach it.
+fn bound_unsent(connection: &Connection) {
+    connection.set_send_window(connection.stats().path.cwnd + QUIC_LOWAT);
+}
+
 async fn copy_stream(
     mut from: impl AsyncRead + Unpin,
     mut to: impl AsyncWrite + Unpin,
+    bounded: Option<&Connection>,
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
     loop {
         let read = from.read(&mut buffer).await?;
         if read == 0 {
             return to.flush().await;
+        }
+        if let Some(connection) = bounded {
+            bound_unsent(connection);
         }
         to.write_all(&buffer[..read]).await?;
     }
@@ -1043,6 +1077,14 @@ mod tests {
                 "keep_alive_interval: {:?}",
                 Some(KEEP_ALIVE_INTERVAL)
             )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("initial_rtt: {REMOTE_QUIC_INITIAL_RTT:?}")),
+            "transport must not keep quinn's 333 ms first-RTT guess: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("send_window: {QUIC_SEND_WINDOW}")),
             "{rendered}"
         );
     }

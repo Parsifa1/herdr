@@ -7,6 +7,23 @@
 //! either endpoint so neither has to depend on the other's implementation
 //! module.
 
+use std::time::Duration;
+
+/// The RTT guessed before the first sample. quinn's 333 ms default schedules
+/// the first probe timeout about a second out, so a path that loses an
+/// initial packet spends most of the bridge's two-second dial budget waiting
+/// out one backoff. 100 ms leaves room for several attempts in the same
+/// budget, which is what turns "the network blipped during the handshake"
+/// from a failed dial into a slow one.
+pub(crate) const REMOTE_QUIC_INITIAL_RTT: Duration = Duration::from_millis(100);
+
+/// Bytes in flight before any acknowledgment arrives: ten 1200-byte packets.
+/// quinn's BBR default is 200 packets, and BBR paces from that window, so a
+/// first flight on a shared or cellular path offers roughly sixteen times the
+/// link rate and builds a queue that only loss can drain. Cubic and ssh's TCP
+/// both start near ten packets.
+pub(crate) const REMOTE_QUIC_INITIAL_CONGESTION_WINDOW: u64 = 12_000;
+
 /// Connection superseded: a newer generation of the *same* capability was
 /// accepted, so another client now owns this session. The credential is still
 /// valid, but reconnecting with it would fence the client that just took

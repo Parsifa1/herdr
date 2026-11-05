@@ -18,6 +18,7 @@ use super::frame::{hash_bytes, lock, read_async_message, write_async_message};
 use super::quic_policy::{
     REMOTE_QUIC_CLOSE_AUTH, REMOTE_QUIC_CLOSE_EVICTED, REMOTE_QUIC_CLOSE_PROTOCOL,
     REMOTE_QUIC_CLOSE_REPLACED, REMOTE_QUIC_CLOSE_SHUTDOWN,
+    REMOTE_QUIC_INITIAL_CONGESTION_WINDOW, REMOTE_QUIC_INITIAL_RTT,
 };
 use crate::protocol::{
     RemoteQuicAccepted, RemoteQuicHello, MAX_FRAME_SIZE, REMOTE_QUIC_ALPN, REMOTE_QUIC_HASH_BYTES,
@@ -543,39 +544,117 @@ async fn dial_candidate(
     result
 }
 
+/// What one turn of the handshake hedge produced.
+enum HandshakeEvent {
+    Joined(Option<Result<Result<Connection, ConnectError>, tokio::task::JoinError>>),
+    Hedge,
+    OutOfTime,
+}
+
+/// A fresh transport handshake starts this often while the earlier ones are
+/// still pending.
+const HEDGE_INTERVAL: Duration = Duration::from_millis(500);
+/// Handshakes allowed to overlap inside one [`CONNECT_TIMEOUT`] budget.
+const HEDGE_ATTEMPTS: usize = 4;
+
+/// Opens the transport handshake, hedging a stalled attempt by starting
+/// another: a lost initial packet otherwise waits out quinn's retransmission
+/// timer, which on the 333 ms default RTT guess is about a second and most of
+/// this budget.
+///
+/// The hedge stops at the transport. The hello is sent only on the winner, so
+/// every loser is closed before the server validates a connection generation.
+/// Two hellos sharing one generation would be refused as stale with
+/// `REMOTE_QUIC_CLOSE_AUTH`, which the ladder reads as "bootstrap over SSH
+/// again" — a self-inflicted round trip, not a credential problem.
+async fn open_connection(
+    candidate: SocketAddr,
+    endpoint: &Endpoint,
+) -> Result<Connection, ConnectError> {
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    let mut attempts: tokio::task::JoinSet<Result<Connection, ConnectError>> =
+        tokio::task::JoinSet::new();
+    let mut harness_errors = Vec::new();
+    let mut started = 0usize;
+    loop {
+        if started == 0 {
+            spawn_handshake(&mut attempts, candidate, endpoint);
+            started += 1;
+            continue;
+        }
+        let hedge_in = HEDGE_INTERVAL;
+        let stop_in = deadline.saturating_duration_since(Instant::now());
+        let event = tokio::select! {
+            joined = attempts.join_next() => HandshakeEvent::Joined(joined),
+            _ = tokio::time::sleep(hedge_in), if started < HEDGE_ATTEMPTS && stop_in > hedge_in => {
+                HandshakeEvent::Hedge
+            }
+            _ = tokio::time::sleep(stop_in) => HandshakeEvent::OutOfTime,
+        };
+        match event {
+            HandshakeEvent::Joined(Some(Ok(Ok(connection)))) => {
+                attempts.shutdown().await;
+                return Ok(connection);
+            }
+            // A peer that answered no is a verdict, not a stall: another
+            // attempt would be refused the same way.
+            HandshakeEvent::Joined(Some(Ok(Err(error)))) => {
+                attempts.shutdown().await;
+                return Err(error);
+            }
+            HandshakeEvent::Joined(Some(Err(error))) => harness_errors.push(ConnectError::Other(
+                format!("QUIC handshake task failed: {error}"),
+            )),
+            HandshakeEvent::Joined(None) | HandshakeEvent::OutOfTime => break,
+            HandshakeEvent::Hedge => {
+                spawn_handshake(&mut attempts, candidate, endpoint);
+                started += 1;
+            }
+        }
+    }
+    attempts.shutdown().await;
+    harness_errors.push(ConnectError::Timeout(format!(
+        "{candidate}: handshake did not complete in {CONNECT_TIMEOUT:?}"
+    )));
+    Err(combine_dial_errors(harness_errors))
+}
+
+fn spawn_handshake(
+    attempts: &mut tokio::task::JoinSet<Result<Connection, ConnectError>>,
+    candidate: SocketAddr,
+    endpoint: &Endpoint,
+) {
+    let endpoint = endpoint.clone();
+    attempts.spawn(async move {
+        let connecting = endpoint.connect(candidate, TLS_SERVER_NAME).map_err(|err| {
+            ConnectError::Other(format!(
+                "failed to start QUIC connection to {candidate}: {err}"
+            ))
+        })?;
+        match connecting.await {
+            Ok(connection) => Ok(connection),
+            // A fatal TLS alert during the handshake means the verifier
+            // refused the server's certificate: it is no longer the one the
+            // bootstrap pinned, so the server process was replaced and the
+            // cached token died with it.
+            Err(quinn::ConnectionError::TransportError(transport_error))
+                if transport_error.code == quinn::TransportErrorCode::crypto(0x28) =>
+            {
+                Err(ConnectError::Rejected(SessionExit::Rebootstrap(format!(
+                    "{candidate}: {transport_error}"
+                ))))
+            }
+            Err(err) => Err(ConnectError::Other(format!("{candidate}: {err}"))),
+        }
+    });
+}
+
 async fn handshake(
     candidate: SocketAddr,
     endpoint: &Endpoint,
     hello: RemoteQuicHello,
 ) -> Result<(QuicSession, SendStream, RecvStream), ConnectError> {
-    let connecting = endpoint
-        .connect(candidate, TLS_SERVER_NAME)
-        .map_err(|err| {
-            ConnectError::Other(format!(
-                "failed to start QUIC connection to {candidate}: {err}"
-            ))
-        })?;
-    let connection = match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
-        Ok(Ok(connection)) => connection,
-        // A fatal TLS alert during the handshake means the verifier refused
-        // the server's certificate: it is no longer the one the bootstrap
-        // pinned, so the server process was replaced and the cached token
-        // died with it.
-        Ok(Err(quinn::ConnectionError::TransportError(transport_error)))
-            if transport_error.code
-                == quinn::TransportErrorCode::crypto(0x28) =>
-        {
-            return Err(ConnectError::Rejected(SessionExit::Rebootstrap(format!(
-                "{candidate}: {transport_error}"
-            ))))
-        }
-        Ok(Err(err)) => return Err(ConnectError::Other(format!("{candidate}: {err}"))),
-        Err(_) => {
-            return Err(ConnectError::Timeout(format!(
-                "{candidate}: handshake did not complete in {CONNECT_TIMEOUT:?}"
-            )))
-        }
-    };
+    let connection = open_connection(candidate, endpoint).await?;
     let (mut send, mut recv) = match tokio::time::timeout(HELLO_TIMEOUT, connection.open_bi()).await
     {
         Ok(Ok(streams)) => streams,
@@ -777,8 +856,15 @@ fn client_config(fingerprint: [u8; REMOTE_QUIC_HASH_BYTES]) -> Result<quinn::Cli
         // predicted rate. BBR paces to measured bottleneck bandwidth instead.
         // quinn documents its BBR as experimental, and this default currently
         // rests on single-trial shaped-link measurements rather than a
-        // counterbalanced CUBIC/BBR comparison across RTTs and loads.
-        .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        // counterbalanced CUBIC/BBR comparison across RTTs and loads. Its
+        // initial window is overridden below: quinn's BBR starts at 200
+        // packets, which is a queue-building burst, not a probe.
+        .initial_rtt(REMOTE_QUIC_INITIAL_RTT)
+        .congestion_controller_factory(Arc::new({
+            let mut bbr = quinn::congestion::BbrConfig::default();
+            bbr.initial_window(REMOTE_QUIC_INITIAL_CONGESTION_WINDOW);
+            bbr
+        }));
     config.transport_config(Arc::new(transport));
     Ok(config)
 }
