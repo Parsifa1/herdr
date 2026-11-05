@@ -23,7 +23,7 @@ pub(crate) fn decode_endpoint_control(
     if kind == crate::protocol::endpoint::HEALTH_PONG_KIND {
         return Ok(EndpointControlMessage::HealthPong);
     }
-if kind == crate::protocol::endpoint::TRANSPORT_STATUS_KIND {
+    if kind == crate::protocol::endpoint::TRANSPORT_STATUS_KIND {
         #[derive(serde::Deserialize)]
         struct TransportStatus<'a> {
             state: &'a str,
@@ -97,7 +97,7 @@ mod tests {
     }
 
     #[test]
-fn completion_guard_optional_control_round_trips_without_changing_snapshot_codec() {
+    fn completion_guard_optional_control_round_trips_without_changing_snapshot_codec() {
         let projection = crate::protocol::endpoint::EndpointAgentCompletions {
             boot_id: "boot".into(),
             revision: 3,

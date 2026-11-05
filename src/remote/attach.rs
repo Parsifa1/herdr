@@ -535,7 +535,7 @@ impl RemoteHerdr {
         self
     }
 
-fn with_windows_path(mut self, path: String) -> Self {
+    fn with_windows_path(mut self, path: String) -> Self {
         self.resolved_executable = Some(path.clone());
         self.executable = RemoteExecutable::WindowsPath(path);
         self
@@ -1433,7 +1433,10 @@ pub(super) fn apply_noninteractive_ssh_options(command: &mut Command) {
         .arg("ServerAliveCountMax=4");
 }
 
-pub(super) fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
+pub(super) fn apply_managed_ssh_options(
+    command: &mut Command,
+    options: Option<&ManagedSshOptions>,
+) {
     // Compress the first connection too: multiplexed bridges inherit the master's transport.
     command.arg("-C");
     let Some(options) = options else {

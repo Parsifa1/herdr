@@ -689,7 +689,15 @@ mod tests {
         let intent: crate::platform::HostShutdownIntent =
             serde_json::from_value(serde_json::json!({ "announced_at_ns": 42 }))
                 .expect("intent should deserialize");
-        let manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, Some(intent), None);
+        let manifest = manifest_for(
+            empty_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(intent),
+            None,
+        );
         let encoded = serde_json::to_vec(&manifest).expect("manifest should serialize");
         let decoded: HandoffManifest =
             serde_json::from_slice(&encoded).expect("manifest should deserialize");

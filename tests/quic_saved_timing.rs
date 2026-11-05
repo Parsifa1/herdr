@@ -76,7 +76,11 @@ fn timed_client_attach(
     path_env: &str,
     config_home: &Path,
     state_home: &Path,
-) -> (Duration, Box<dyn MasterPty + Send>, Box<dyn portable_pty::Child + Send + Sync>) {
+) -> (
+    Duration,
+    Box<dyn MasterPty + Send>,
+    Box<dyn portable_pty::Child + Send + Sync>,
+) {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -136,7 +140,9 @@ fn timed_client_attach(
 fn warm_connection_through_the_daemon_is_faster_than_the_cold_one() {
     let base = unique_dir("quic-timing");
     fs::create_dir_all(&base).expect("create base");
-    let mut cleanup = TestCleanup { children: Vec::new() };
+    let mut cleanup = TestCleanup {
+        children: Vec::new(),
+    };
 
     let config_home = base.join("config");
     let state_home = base.join("state");
@@ -196,8 +202,7 @@ fn warm_connection_through_the_daemon_is_faster_than_the_cold_one() {
     fs::create_dir_all(&bin).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_herdr"), bin.join("herdr")).unwrap();
     let ssh_commands = base.join("ssh-commands");
-    let quote =
-        |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
     fs::write(
         bin.join("ssh"),
         format!(
@@ -212,7 +217,11 @@ fn warm_connection_through_the_daemon_is_faster_than_the_cold_one() {
     )
     .unwrap();
     fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o700)).unwrap();
-    let path_env = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
 
     let stable_socket = crate_persisted_path();
     // A daemon left over from a previous test run still owns the stable

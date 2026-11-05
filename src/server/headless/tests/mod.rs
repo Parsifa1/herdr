@@ -375,7 +375,10 @@ async fn remote_quic_endpoint_is_bound_at_startup_under_auto_transport() {
     server.ensure_remote_quic().expect("endpoint starts");
     let quic = server.remote_quic.as_ref().expect("endpoint is live");
     let port = quic.port();
-    assert!((48000..=48100).contains(&port), "port {port} must come from the default range");
+    assert!(
+        (48000..=48100).contains(&port),
+        "port {port} must come from the default range"
+    );
     shutdown_test_runtimes(&mut server);
 }
 
@@ -385,7 +388,9 @@ async fn remote_quic_endpoint_is_bound_at_startup_under_auto_transport() {
 fn remote_quic_endpoint_stays_unbound_under_ssh_transport() {
     let mut server = test_headless_server();
     server.remote_config.transport = crate::config::RemoteTransportConfig::Ssh;
-    server.ensure_remote_quic().expect("ssh is a no-op, not an error");
+    server
+        .ensure_remote_quic()
+        .expect("ssh is a no-op, not an error");
     assert!(server.remote_quic.is_none());
     shutdown_test_runtimes(&mut server);
 }

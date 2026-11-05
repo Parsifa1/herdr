@@ -382,7 +382,10 @@ impl BenchServer {
     }
 
     fn shutdown(&mut self) {
-        self.server_stop.request(crate::server::shutdown::ShutdownReason::Signal(crate::platform::ServerQuitSignal::Terminate));
+        self.server_stop
+            .request(crate::server::shutdown::ShutdownReason::Signal(
+                crate::platform::ServerQuitSignal::Terminate,
+            ));
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }

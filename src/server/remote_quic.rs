@@ -689,10 +689,7 @@ async fn serve_connection(connection: Connection, state: Arc<ServerState>) -> Re
 /// measures path liveness from these replies. Anything else stays opaque and
 /// is discarded so it does not fill the stream's receive buffer; the send half
 /// is held open so the bridge never sees the liveness channel close.
-async fn drain_control_stream(
-    mut send: SendStream,
-    mut recv: RecvStream,
-) -> Result<(), String> {
+async fn drain_control_stream(mut send: SendStream, mut recv: RecvStream) -> Result<(), String> {
     loop {
         let control: Result<crate::protocol::ClientMessage, String> =
             read_async_message(&mut recv, MAX_HELLO_SIZE).await;
@@ -1256,11 +1253,7 @@ mod tests {
         assert_eq!(accepted.connection_generation, connection_generation);
         // The hello stream stays as the liveness channel; a session rides on
         // its own stream, the way the multiplexing bridge attaches one.
-        let (send, recv) = client
-            .connection
-            .open_bi()
-            .await
-            .expect("open data stream");
+        let (send, recv) = client.connection.open_bi().await.expect("open data stream");
         LiveTestClient {
             _endpoint: client._endpoint,
             connection: client.connection,
@@ -1373,11 +1366,7 @@ mod tests {
         } = test_server_on_free_port();
         let record = mint(&server, 31);
         let mut client = connect_live_test_client(&record, 31, 1).await;
-        client
-            .send
-            .write_all(b"ping")
-            .await
-            .expect("write ping");
+        client.send.write_all(b"ping").await.expect("write ping");
         let adapted = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
             .await
             .expect("the sink is handed a client socket")
@@ -1395,10 +1384,7 @@ mod tests {
             .expect("read ping");
         assert_eq!(&ping, b"ping");
 
-        adapted
-            .write_all(b"pong")
-            .await
-            .expect("write pong");
+        adapted.write_all(b"pong").await.expect("write pong");
         let mut pong = [0u8; 4];
         tokio::time::timeout(Duration::from_secs(5), client.recv.read_exact(&mut pong))
             .await
@@ -1412,17 +1398,13 @@ mod tests {
     /// silence and tears the connection down.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_health_ping_on_the_hello_stream_is_answered_with_a_pong() {
-        let TestServer {
-            server,
-            accepted,
-        } = test_server_on_free_port();
+        let TestServer { server, accepted } = test_server_on_free_port();
         drop(accepted);
         let record = mint(&server, 41);
         let mut client = dial_with_hello(&record, 41, 1).await;
-        let _accepted: RemoteQuicAccepted =
-            read_async_message(&mut client.recv, MAX_HELLO_SIZE)
-                .await
-                .expect("read accepted");
+        let _accepted: RemoteQuicAccepted = read_async_message(&mut client.recv, MAX_HELLO_SIZE)
+            .await
+            .expect("read accepted");
         let ping = crate::protocol::ClientMessage::EndpointControl {
             kind: crate::protocol::endpoint::HEALTH_PING_KIND.to_owned(),
             data: String::new(),
@@ -1450,14 +1432,22 @@ mod tests {
         } = test_server_on_free_port();
         let record = mint(&server, 22);
         let mut first = connect_live_test_client(&record, 22, 1).await;
-        first.send.write_all(b"x").await.expect("wake the accept loop");
+        first
+            .send
+            .write_all(b"x")
+            .await
+            .expect("wake the accept loop");
         let _first_socket = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
             .await
             .expect("first client reaches the acceptor")
             .expect("sink channel open");
 
         let mut second = connect_live_test_client(&record, 22, 2).await;
-        second.send.write_all(b"x").await.expect("wake the accept loop");
+        second
+            .send
+            .write_all(b"x")
+            .await
+            .expect("wake the accept loop");
         assert_eq!(
             closed_code(&first.connection).await,
             u64::from(REMOTE_QUIC_CLOSE_REPLACED)
@@ -1498,7 +1488,11 @@ mod tests {
         let mut first = connect_live_test_client(&record, 23, 2).await;
         // Held: dropping the acceptor's socket would end the live connection
         // for resync, which is not the rejection this test is about.
-        first.send.write_all(b"x").await.expect("wake the accept loop");
+        first
+            .send
+            .write_all(b"x")
+            .await
+            .expect("wake the accept loop");
         let _first_socket = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
             .await
             .expect("first client reaches the acceptor")
@@ -1521,7 +1515,11 @@ mod tests {
         } = test_server_on_free_port();
         let record = mint(&server, 24);
         let mut client = connect_live_test_client(&record, 24, 1).await;
-        client.send.write_all(b"x").await.expect("wake the accept loop");
+        client
+            .send
+            .write_all(b"x")
+            .await
+            .expect("wake the accept loop");
         let _socket = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
             .await
             .expect("client reaches the acceptor")

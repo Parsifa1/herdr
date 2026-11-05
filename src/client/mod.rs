@@ -2117,7 +2117,7 @@ async fn run_client_loop(
                         }
                         let snapshot = match endpoint::decode_endpoint_control(&kind, &data) {
                             Ok(endpoint::EndpointControlMessage::HealthPong) => continue,
-Ok(endpoint::EndpointControlMessage::AgentViewProjection(
+                            Ok(endpoint::EndpointControlMessage::AgentViewProjection(
                                 projection,
                             )) => {
                                 if let Some(shell) = state.shell.as_mut() {
@@ -2139,7 +2139,7 @@ Ok(endpoint::EndpointControlMessage::AgentViewProjection(
                                 }
                                 continue;
                             }
-Ok(endpoint::EndpointControlMessage::TransportRecovering(
+                            Ok(endpoint::EndpointControlMessage::TransportRecovering(
                                 recovering,
                             )) => {
                                 write_stream.set_recovering(&endpoint_id, generation, recovering);

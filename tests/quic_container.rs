@@ -39,7 +39,12 @@ fn timed_client_attach(
     home: &Path,
     config_home: &Path,
     state_home: &Path,
-) -> (Duration, Box<dyn MasterPty + Send>, Box<dyn portable_pty::Child + Send + Sync>, mpsc::Receiver<Vec<u8>>) {
+) -> (
+    Duration,
+    Box<dyn MasterPty + Send>,
+    Box<dyn portable_pty::Child + Send + Sync>,
+    mpsc::Receiver<Vec<u8>>,
+) {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -123,7 +128,9 @@ struct ImageCleanupGuard(&'static str);
 impl Drop for ImageCleanupGuard {
     fn drop(&mut self) {
         let _ = Command::new("docker").args(["rmi", "-f", self.0]).output();
-        let _ = Command::new("docker").args(["image", "prune", "-f"]).output();
+        let _ = Command::new("docker")
+            .args(["image", "prune", "-f"])
+            .output();
     }
 }
 
@@ -154,7 +161,12 @@ async fn persisted_bridge_speeds_up_reattach_over_real_ssh() {
     let staged_herdr = base.join("herdr");
     fs::copy(&herdr, &staged_herdr).expect("copy herdr to staging");
     let _ = Command::new("patchelf")
-        .args(["--set-interpreter", "/lib64/ld-linux-x86-64.so.2", "--set-rpath", "/lib:/usr/lib"])
+        .args([
+            "--set-interpreter",
+            "/lib64/ld-linux-x86-64.so.2",
+            "--set-rpath",
+            "/lib:/usr/lib",
+        ])
         .arg(&staged_herdr)
         .status();
 
@@ -247,7 +259,10 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         while let Ok(chunk) = cold_rx.try_recv() {
             cold_output.extend_from_slice(&chunk);
         }
-        eprintln!("[quic-container] cold output:\n{}", String::from_utf8_lossy(&cold_output));
+        eprintln!(
+            "[quic-container] cold output:\n{}",
+            String::from_utf8_lossy(&cold_output)
+        );
         fn dump_logs(dir: &Path) {
             if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.flatten() {
@@ -269,7 +284,10 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         "first client must not be killed or fenced by the second client"
     );
     assert!(
-        concurrent_child.try_wait().expect("concurrent status").is_none(),
+        concurrent_child
+            .try_wait()
+            .expect("concurrent status")
+            .is_none(),
         "second client must be running healthy alongside the first"
     );
 

@@ -125,7 +125,6 @@ impl QuicBridgeConfig {
     }
 }
 
-
 /// Listener owning the local socket the thin client attaches to. Same shape as
 /// [`super::attach::SshStdioBridge`]: a private socket, one accept thread, and
 /// a stop flag that unblocks it.
@@ -409,7 +408,6 @@ fn quic_reconnect_delay(attempt: u32) -> Duration {
         )
         .min(QUIC_RECONNECT_MAX_DELAY)
 }
-
 
 /// Owns the shared QUIC session for the whole bridge: every local client the
 /// listener hands over rides one bidirectional stream of the same connection.
@@ -712,9 +710,7 @@ fn carry_on_ssh(
     should_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     let _guard = ClientGuard::new();
-    info!(
-        "carrying the remote client on the SSH stdio bridge"
-    );
+    info!("carrying the remote client on the SSH stdio bridge");
     let remote_command = config.remote_herdr.bridge_command(&config.session);
     bridge_connection(
         stream,
@@ -899,7 +895,6 @@ where
         .await
         .map_err(|err| format!("frame flush failed: {err}"))
 }
-
 
 /// The bridge's own liveness probe. Upstream's health ping is a plain endpoint
 /// control frame, so the server answers it without knowing a bridge exists.
@@ -1169,7 +1164,12 @@ fn request_remote_quic_bootstrap(config: &QuicBridgeConfig) -> io::Result<Remote
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let output = if config.noninteractive {
-        wait_with_output_timeout(command.spawn()?, None, BOOTSTRAP_SSH_TIMEOUT, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))?
+        wait_with_output_timeout(
+            command.spawn()?,
+            None,
+            BOOTSTRAP_SSH_TIMEOUT,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?
     } else {
         command.output()?
     };

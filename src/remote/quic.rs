@@ -17,8 +17,8 @@ use tracing::debug;
 use super::frame::{hash_bytes, lock, read_async_message, write_async_message};
 use super::quic_policy::{
     REMOTE_QUIC_CLOSE_AUTH, REMOTE_QUIC_CLOSE_EVICTED, REMOTE_QUIC_CLOSE_PROTOCOL,
-    REMOTE_QUIC_CLOSE_REPLACED, REMOTE_QUIC_CLOSE_SHUTDOWN,
-    REMOTE_QUIC_INITIAL_CONGESTION_WINDOW, REMOTE_QUIC_INITIAL_RTT,
+    REMOTE_QUIC_CLOSE_REPLACED, REMOTE_QUIC_CLOSE_SHUTDOWN, REMOTE_QUIC_INITIAL_CONGESTION_WINDOW,
+    REMOTE_QUIC_INITIAL_RTT,
 };
 use crate::protocol::{
     RemoteQuicAccepted, RemoteQuicHello, MAX_FRAME_SIZE, REMOTE_QUIC_ALPN, REMOTE_QUIC_HASH_BYTES,
@@ -626,11 +626,13 @@ fn spawn_handshake(
 ) {
     let endpoint = endpoint.clone();
     attempts.spawn(async move {
-        let connecting = endpoint.connect(candidate, TLS_SERVER_NAME).map_err(|err| {
-            ConnectError::Other(format!(
-                "failed to start QUIC connection to {candidate}: {err}"
-            ))
-        })?;
+        let connecting = endpoint
+            .connect(candidate, TLS_SERVER_NAME)
+            .map_err(|err| {
+                ConnectError::Other(format!(
+                    "failed to start QUIC connection to {candidate}: {err}"
+                ))
+            })?;
         match connecting.await {
             Ok(connection) => Ok(connection),
             // A fatal TLS alert during the handshake means the verifier
@@ -1431,10 +1433,7 @@ mod tests {
         // certificate than the bootstrap pinned: the server process was
         // replaced, so the credential died with it.
         assert!(
-            matches!(
-                error,
-                ConnectError::Rejected(SessionExit::Rebootstrap(_))
-            ),
+            matches!(error, ConnectError::Rejected(SessionExit::Rebootstrap(_))),
             "a fingerprint mismatch must retire the credential: {error}"
         );
     }

@@ -73,10 +73,7 @@ pub(crate) fn connect_persisted_quic(
     }
 }
 
-fn connect_stream(
-    path: &Path,
-    cancelled: &AtomicBool,
-) -> io::Result<PersistedQuicStream> {
+fn connect_stream(path: &Path, cancelled: &AtomicBool) -> io::Result<PersistedQuicStream> {
     crate::ipc::connect_local_stream_cancellable(
         path,
         cancelled,
@@ -113,7 +110,10 @@ fn spawn_persisted_daemon(profile_id: &str, target: &str, session: &str) -> io::
         .stderr(Stdio::null());
     crate::platform::detach_server_daemon_command(&mut command);
     command.spawn().map(|_| ()).map_err(|err| {
-        io::Error::new(err.kind(), format!("failed to spawn remote bridge daemon: {err}"))
+        io::Error::new(
+            err.kind(),
+            format!("failed to spawn remote bridge daemon: {err}"),
+        )
     })
 }
 
@@ -148,7 +148,10 @@ pub(crate) fn run_remote_bridge_daemon(args: &[String]) -> io::Result<()> {
         },
         path,
     )?;
-    let idle_timeout = crate::config::Config::load().config.remote.bridge_idle_timeout_seconds;
+    let idle_timeout = crate::config::Config::load()
+        .config
+        .remote
+        .bridge_idle_timeout_seconds;
     bridge.persist_when_idle(idle_timeout);
 
     // Park the main thread; the bridge's accept thread exits the process on

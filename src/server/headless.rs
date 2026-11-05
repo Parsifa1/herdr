@@ -2766,7 +2766,9 @@ impl HeadlessServer {
     /// rejected, so the credential stays and the port never opens.
     #[cfg(unix)]
     fn ensure_remote_quic(&mut self) -> Result<(), String> {
-        if self.remote_quic.is_some() || self.remote_config.transport == crate::config::RemoteTransportConfig::Ssh {
+        if self.remote_quic.is_some()
+            || self.remote_config.transport == crate::config::RemoteTransportConfig::Ssh
+        {
             return Ok(());
         }
         let sink = self.remote_quic_sink();
