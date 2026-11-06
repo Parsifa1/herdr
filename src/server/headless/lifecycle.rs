@@ -60,20 +60,7 @@ impl HeadlessServer {
         // instead of running a fresh SSH bootstrap.
         let (remote_quic_state, remote_quic_sockets) = match self.remote_quic.as_ref() {
             Some(server) => match server.export_handoff() {
-                Ok((state, sockets))
-                    if pane_by_terminal.len() + sockets.len()
-                        <= crate::server::handoff::MAX_FDS_PER_HANDOFF =>
-                {
-                    (Some(state), sockets)
-                }
-                Ok((_, sockets)) => {
-                    info!(
-                        panes = pane_by_terminal.len(),
-                        quic_sockets = sockets.len(),
-                        "no room left in the handoff for the QUIC sockets; remote clients will re-bootstrap"
-                    );
-                    (None, Vec::new())
-                }
+                Ok((state, sockets)) => (Some(state), sockets),
                 Err(err) => {
                     warn!(err = %err, "failed to export QUIC handoff state; remote clients will re-bootstrap");
                     (None, Vec::new())

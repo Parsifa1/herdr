@@ -2146,26 +2146,40 @@ mod tests {
         use portable_pty::CommandBuilder;
 
         let pair = open_test_pty();
-
         let mut cmd = CommandBuilder::new("bash");
         cmd.arg("-c");
-        cmd.arg("bash -c 'exec -a codex sleep 999' & wait");
+        cmd.arg("bash -c 'exec -a codex bash -c \"sleep 999; :\"' & wait");
         let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn");
         let pid = child.process_id().expect("no pid");
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let job = loop {
+            if let Some(job) = foreground_job(pid) {
+                if job.processes.iter().any(|process| {
+                    process
+                        .argv
+                        .as_deref()
+                        .is_some_and(|argv| argv.first().is_some_and(|arg| arg == "codex"))
+                }) {
+                    break job;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected foreground job"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
 
-        let job = foreground_job(pid);
-        let process_group_id = job.as_ref().map(|job| job.process_group_id).unwrap_or(pid);
+        let process_group_id = job.process_group_id;
         unsafe {
             libc::kill(-(process_group_id as i32), libc::SIGKILL);
         }
         child.wait().ok();
 
-        let job = job.expect("expected foreground job");
         assert!(
-            job.processes.iter().any(|process| process.name == "bash")
+            job.processes.iter().any(|process| process.pid == pid)
                 && job.processes.iter().any(|process| {
-                    process.name == "sleep"
+                    process.name == "bash"
                         && process
                             .argv
                             .as_deref()

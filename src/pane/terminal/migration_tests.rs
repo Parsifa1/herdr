@@ -136,15 +136,18 @@ fn primary_screen_replay_honors_ed3_for_droid_at_chunk_boundaries() {
         })
         .unwrap();
     let mut command = portable_pty::CommandBuilder::new("bash");
-    command.args(["-c", "exec -a droid sleep 999"]);
+    command.args(["-c", "exec -a droid bash -c 'sleep 999; :'"]);
     let child = ChildGuard(pair.slave.spawn_command(command).unwrap());
     let pid = child.0.process_id().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let ready = crate::detect::foreground_job(pid).is_some_and(|job| {
-            job.processes
-                .iter()
-                .any(|process| process.cmdline.as_deref() == Some("droid 999"))
+            job.processes.iter().any(|process| {
+                process
+                    .argv
+                    .as_ref()
+                    .is_some_and(|argv| argv.first().is_some_and(|arg| arg == "droid"))
+            })
         });
         if ready {
             break;

@@ -21,15 +21,17 @@ mod support;
 const PROFILE: &str = "0123456789abcdef0123456789abcdef";
 const TARGET: &str = "fakehost";
 
-fn unique_dir(prefix: &str) -> PathBuf {
+fn unique_dir(_prefix: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch")
         .as_nanos();
-    // Under /tmp, not temp_dir(): the server binds its socket inside this
-    // path, and sun_path is 108 bytes. A CI TMPDIR like
-    // /home/runner/work/_temp/nix-shell.XXXXXX leaves room for nothing.
-    PathBuf::from("/tmp").join(format!("herdr-{prefix}-{}-{nonce}", std::process::id()))
+    PathBuf::from("/tmp").join(format!("hqp-{nonce:x}"))
+}
+
+fn crate_persisted_path(base: &Path) -> PathBuf {
+    let hash = persisted_socket_hash(PROFILE, TARGET, "default");
+    base.join(format!("herdr-qp-{PROFILE}-{hash}.sock"))
 }
 
 fn wait_for_file(path: &Path, log: &Path, timeout: Duration) {
@@ -91,6 +93,7 @@ fn spawn_client_pty(
     path_env: &str,
     config_home: &Path,
     state_home: &Path,
+    temp_dir: &Path,
 ) -> SpawnClientPtyReturn {
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -107,6 +110,7 @@ fn spawn_client_pty(
         cmd.arg(arg);
     }
     cmd.env("PATH", path_env);
+    cmd.env("TMPDIR", temp_dir);
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_STATE_HOME", state_home);
     cmd.env("SHELL", "/bin/sh");
@@ -147,6 +151,8 @@ fn collected(rx: &mpsc::Receiver<Vec<u8>>) -> String {
 fn saved_endpoint_connections_reuse_the_persisted_bridge_daemon() {
     let base = unique_dir("quic-saved");
     fs::create_dir_all(&base).expect("create base");
+    let temp_dir = base.join("tmp");
+    fs::create_dir_all(&temp_dir).unwrap();
     let mut cleanup = TestCleanup {
         children: Vec::new(),
     };
@@ -237,14 +243,14 @@ fn saved_endpoint_connections_reuse_the_persisted_bridge_daemon() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let stable_socket = crate_persisted_path();
+    let stable_socket = crate_persisted_path(&temp_dir);
     let _ = fs::remove_file(&stable_socket);
 
     // First client connection: the supervisor builds the bridge through the
     // fake ssh; connect_saved_ssh spawns the persisted daemon because no
     // socket is live yet.
     let (_master, mut child, rx) =
-        spawn_client_pty(&["client"], &path_env, &config_home, &state_home);
+        spawn_client_pty(&["client"], &path_env, &config_home, &state_home, &temp_dir);
     let mut output = String::new();
     assert!(
         wait_until(Duration::from_secs(30), Duration::from_millis(100), || {
@@ -283,7 +289,7 @@ fn saved_endpoint_connections_reuse_the_persisted_bridge_daemon() {
     let before_second = calls_after_first;
 
     let (_master2, mut child2, rx2) =
-        spawn_client_pty(&["client"], &path_env, &config_home, &state_home);
+        spawn_client_pty(&["client"], &path_env, &config_home, &state_home, &temp_dir);
     let mut output2 = String::new();
     assert!(
         wait_until(Duration::from_secs(30), Duration::from_millis(100), || {
@@ -304,12 +310,4 @@ fn saved_endpoint_connections_reuse_the_persisted_bridge_daemon() {
     let _ = &mut child;
     let _ = &mut child2;
     let _ = fs::remove_file(&stable_socket);
-}
-
-/// Same derivation as quic_saved.rs persisted_bridge_path: readable form via
-/// platform::remote_bridge_endpoint_path with profile and hash.
-fn crate_persisted_path() -> PathBuf {
-    let hash = persisted_socket_hash(PROFILE, TARGET, "default");
-    let readable = format!("herdr-qp-{PROFILE}-{hash}.sock");
-    std::env::temp_dir().join(readable)
 }

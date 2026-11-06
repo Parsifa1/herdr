@@ -22,15 +22,12 @@ const PROFILE: &str = "0123456789abcdef0123456789abcdef";
 const TARGET: &str = "fakehost";
 const RENDERED_OUTPUT_BYTES: usize = 2000;
 
-fn unique_dir(prefix: &str) -> PathBuf {
+fn unique_dir(_prefix: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch")
         .as_nanos();
-    // Under /tmp, not temp_dir(): the server binds its socket inside this
-    // path, and sun_path is 108 bytes. A CI TMPDIR like
-    // /home/runner/work/_temp/nix-shell.XXXXXX leaves room for nothing.
-    PathBuf::from("/tmp").join(format!("herdr-{prefix}-{}-{nonce}", std::process::id()))
+    PathBuf::from("/tmp").join(format!("hqt-{nonce:x}"))
 }
 
 fn wait_for_file(path: &Path, log: &Path, timeout: Duration) {
@@ -57,9 +54,9 @@ fn persisted_socket_hash(profile_id: &str, target: &str, session: &str) -> Strin
     format!("{:016x}", hasher.finish())
 }
 
-fn crate_persisted_path() -> PathBuf {
+fn crate_persisted_path(temp_dir: &Path) -> PathBuf {
     let hash = persisted_socket_hash(PROFILE, TARGET, "default");
-    std::env::temp_dir().join(format!("herdr-qp-{PROFILE}-{hash}.sock"))
+    temp_dir.join(format!("herdr-qp-{PROFILE}-{hash}.sock"))
 }
 
 struct TestCleanup {
@@ -78,6 +75,7 @@ impl Drop for TestCleanup {
 /// Spawn a headless client and time it from spawn until its pty produced a
 /// rendered screen (the TUI output that follows a completed handshake).
 fn timed_client_attach(
+    temp_dir: &Path,
     path_env: &str,
     config_home: &Path,
     state_home: &Path,
@@ -99,6 +97,7 @@ fn timed_client_attach(
     support::isolate_herdr_test_process(&mut cmd);
     cmd.arg("client");
     cmd.env("PATH", path_env);
+    cmd.env("TMPDIR", temp_dir);
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_STATE_HOME", state_home);
     cmd.env("SHELL", "/bin/sh");
@@ -145,6 +144,8 @@ fn timed_client_attach(
 fn warm_connection_through_the_daemon_is_faster_than_the_cold_one() {
     let base = unique_dir("quic-timing");
     fs::create_dir_all(&base).expect("create base");
+    let temp_dir = base.join("tmp");
+    fs::create_dir_all(&temp_dir).unwrap();
     let mut cleanup = TestCleanup {
         children: Vec::new(),
     };
@@ -231,29 +232,19 @@ fn warm_connection_through_the_daemon_is_faster_than_the_cold_one() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let stable_socket = crate_persisted_path();
-    // A daemon left over from a previous test run still owns the stable
-    // socket's listener; its file can be removed but the process must die or
-    // this run's cold connection would silently attach through it.
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", &format!("remote-bridge-daemon {PROFILE} ")])
-        .status();
+    let stable_socket = crate_persisted_path(&temp_dir);
     let _ = fs::remove_file(&stable_socket);
-    thread::sleep(Duration::from_millis(200));
-
     // Cold: no daemon yet; the client pays SSH discovery and bootstrap.
+    let daemon_log = state_home.join("herdr-dev/herdr-remote-bridge-daemon.log");
     let (cold, _cold_master, mut cold_child) =
-        timed_client_attach(&path_env, &config_home, &state_home);
-    let daemon_log = state_home
-        .join("herdr-dev")
-        .join("herdr-remote-bridge-daemon.log");
+        timed_client_attach(&temp_dir, &path_env, &config_home, &state_home);
     wait_for_file(&stable_socket, &daemon_log, Duration::from_secs(15));
 
     // Warm: the client attaches through the daemon. The freshly spawned
     // daemon still owes its own one-time credential bootstrap, so allow it
     // to settle before timing the steady state.
     let (warm, _warm_master, mut warm_child) =
-        timed_client_attach(&path_env, &config_home, &state_home);
+        timed_client_attach(&temp_dir, &path_env, &config_home, &state_home);
     let settle = Instant::now() + Duration::from_secs(5);
     let mut settled_calls = 0usize;
     while Instant::now() < settle {
@@ -266,7 +257,7 @@ fn warm_connection_through_the_daemon_is_faster_than_the_cold_one() {
     // Steady state: the daemon owns a warm credential; this connection must
     // run zero SSH commands.
     let (third, _third_master, mut third_child) =
-        timed_client_attach(&path_env, &config_home, &state_home);
+        timed_client_attach(&temp_dir, &path_env, &config_home, &state_home);
     let steady_calls = fs::read_to_string(&ssh_commands)
         .map(|text| text.lines().count())
         .unwrap_or(0);

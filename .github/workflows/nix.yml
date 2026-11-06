@@ -16,6 +16,7 @@ concurrency:
 jobs:
   build:
     name: build (${{ matrix.name }})
+    needs: test
     strategy:
       fail-fast: false
       matrix:

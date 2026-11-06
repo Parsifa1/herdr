@@ -27,8 +27,6 @@ const OWNED_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 // batch stays well below both limits and the number of panes stays unbounded.
 #[cfg(unix)]
 const FDS_PER_MESSAGE: usize = 64;
-#[cfg(unix)]
-pub(crate) const MAX_FDS_PER_HANDOFF: usize = 64;
 pub(crate) const MAX_REPLAY_BYTES_PER_PANE: usize = 8 * 1024;
 #[cfg(unix)]
 pub(crate) const COMMIT_TIMEOUT: Duration = READY_TIMEOUT;
@@ -291,11 +289,6 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
         .panes
         .len()
         .saturating_add(manifest.remote_quic_fd_count());
-    if expected_fds > MAX_FDS_PER_HANDOFF {
-        return Err(io::Error::other(format!(
-            "handoff manifest describes {expected_fds} fds, more than the {MAX_FDS_PER_HANDOFF} a handoff carries"
-        )));
-    }
     stream.write_all(b"validated\n")?;
     stream.flush()?;
     let fds = recv_fds(&stream, expected_fds)?;
