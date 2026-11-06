@@ -953,8 +953,6 @@ struct Credential {
     candidates: Vec<SocketAddr>,
     /// Connection generation this dial presents.
     generation: u64,
-    /// Whether this credential has carried a live QUIC session before.
-    proven: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1112,7 +1110,6 @@ fn reserve_cached_credential(
         record: entry.record.clone(),
         candidates: entry.candidates.clone(),
         generation,
-        proven: entry.proven,
     };
     save_credential_cache(cache);
     Some(credential)
