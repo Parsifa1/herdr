@@ -711,7 +711,11 @@ fn carry_on_ssh(
 ) -> io::Result<()> {
     let _guard = ClientGuard::new();
     info!("carrying the remote client on the SSH stdio bridge");
-    let remote_command = config.remote_herdr.bridge_command(&config.session);
+    let remote_command = if config.noninteractive {
+        config.remote_herdr.helper_bridge_command(&config.session)
+    } else {
+        config.remote_herdr.bridge_command(&config.session)
+    };
     bridge_connection(
         stream,
         &config.target,

@@ -500,6 +500,19 @@ impl RemoteHerdr {
         self.executable.bridge_command(session_name)
     }
 
+    /// The bridge command for a helper the client starts and may forget about.
+    /// It opts into the remote bridge's idle timeout when that machine
+    /// advertises support, so the remote side exits on its own instead of
+    /// outliving the client that asked for it.
+    pub(super) fn helper_bridge_command(&self, session_name: &str) -> String {
+        if self.bridge_idle_timeout {
+            self.executable
+                .bridge_command_with_idle_timeout(session_name, true)
+        } else {
+            self.bridge_command(session_name)
+        }
+    }
+
     pub(super) fn machine_metadata(&self) -> Option<crate::client::endpoint::SshMachineMetadata> {
         let executable = self.resolved_executable.clone()?;
         let metadata = crate::client::endpoint::SshMachineMetadata {
@@ -3046,12 +3059,10 @@ impl SshStdioBridge {
     ) -> io::Result<Self> {
         Self::start_command(
             target,
-            if noninteractive && remote_herdr.bridge_idle_timeout {
-                remote_herdr
-                    .executable
-                    .bridge_command_with_idle_timeout(&session_name, true)
+            if noninteractive {
+                remote_herdr.helper_bridge_command(&session_name)
             } else {
-                remote_herdr.executable.bridge_command(&session_name)
+                remote_herdr.bridge_command(&session_name)
             },
             local_socket,
             ssh_options,
