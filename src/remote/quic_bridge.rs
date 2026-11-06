@@ -1524,13 +1524,20 @@ mod tests {
         );
         assert!(cache.is_empty(), "the expired entry is evicted");
 
-        // Same record, one second before the slack window opens: still usable.
+        // One second outside the slack window: `expires - now` must exceed it.
         let mut cache = CredentialCache::new();
         store_credential(&mut cache, key(), record(expires), Vec::new());
         assert!(
-            reserve_cached_credential(&mut cache, &key(), expires - 1).is_some(),
+            reserve_cached_credential(&mut cache, &key(), expires - slack - 1).is_some(),
             "a credential inside its lifetime is usable"
         );
+    }
+
+    #[test]
+    fn a_future_expiry_is_always_reserved() {
+        let mut cache = CredentialCache::new();
+        store_credential(&mut cache, key(), record(u64::MAX), Vec::new());
+        assert!(reserve_cached_credential(&mut cache, &key(), now_unix()).is_some());
     }
 
     /// End to end over the real machinery: `ssh localhost` runs this build's
