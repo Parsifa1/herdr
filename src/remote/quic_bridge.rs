@@ -1171,7 +1171,6 @@ fn mark_credential_proven(key: &CredentialKey) {
         return;
     }
     entry.proven = true;
-    drop(entry);
     save_credential_cache(&cache);
 }
 
