@@ -255,11 +255,19 @@ fn saved_endpoint_connections_reuse_the_persisted_bridge_daemon() {
     );
 
     // The daemon must exist and own the stable socket.
+    let daemon_log = state_home
+        .join("herdr-dev")
+        .join("herdr-remote-bridge-daemon.log");
+    let client_log = state_home.join("herdr-dev").join("herdr-client.log");
     assert!(
         wait_until(Duration::from_secs(15), Duration::from_millis(50), || {
             stable_socket.exists()
         }),
-        "persisted bridge daemon never bound the stable socket"
+        "persisted bridge daemon never bound {}; daemon log:\n{}\nclient log:\n{}\nssh commands:\n{}",
+        stable_socket.display(),
+        fs::read_to_string(&daemon_log).unwrap_or_default(),
+        fs::read_to_string(&client_log).unwrap_or_default(),
+        fs::read_to_string(&ssh_commands).unwrap_or_default()
     );
 
     // A second connection must go through the daemon: no new SSH commands

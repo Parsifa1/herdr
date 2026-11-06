@@ -244,7 +244,10 @@ fn warm_connection_through_the_daemon_is_faster_than_the_cold_one() {
     // Cold: no daemon yet; the client pays SSH discovery and bootstrap.
     let (cold, _cold_master, mut cold_child) =
         timed_client_attach(&path_env, &config_home, &state_home);
-    wait_for_file(&stable_socket, &ssh_commands, Duration::from_secs(15));
+    let daemon_log = state_home
+        .join("herdr-dev")
+        .join("herdr-remote-bridge-daemon.log");
+    wait_for_file(&stable_socket, &daemon_log, Duration::from_secs(15));
 
     // Warm: the client attaches through the daemon. The freshly spawned
     // daemon still owes its own one-time credential bootstrap, so allow it
