@@ -1271,8 +1271,15 @@ fn remote_quic_bootstrap_command(
         format_logical_client_id(logical_client_id)
     );
     if let Some(certificate) = certificate {
+        // The helper runs on the server, so it cannot name this machine: the
+        // label travels with the certificate or devices would all be listed
+        // under the server's own hostname.
         command.push(' ');
         command.push_str(certificate);
+        command.push(' ');
+        command.push_str(&crate::remote::device::encode_hex(
+            crate::remote::device::local_label().as_bytes(),
+        ));
     }
     remote_session_command(remote_herdr, session, &command)
 }

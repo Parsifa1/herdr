@@ -206,6 +206,13 @@ pub(crate) fn devices_path() -> PathBuf {
     crate::config::config_dir().join(DEVICES_FILE)
 }
 
+/// This machine's name, as sent to the server at enrollment.
+pub(crate) fn local_label() -> String {
+    crate::platform::hostname()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown-device".to_owned())
+}
+
 /// Records the certificate the SSH-authenticated bootstrap presented.
 pub(crate) fn enroll(certificate: &[u8], name: &str) -> io::Result<bool> {
     let path = devices_path();

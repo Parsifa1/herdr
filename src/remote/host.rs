@@ -44,25 +44,41 @@ pub(crate) fn run_remote_client_bridge(args: &[String]) -> io::Result<()> {
 /// what lets it reconnect later without SSH.
 #[cfg(unix)]
 pub(crate) fn run_remote_quic_bootstrap(args: &[String]) -> io::Result<()> {
-    let (logical_client_id, certificate) = match args {
-        [id] => (id.as_str(), None),
+    let (logical_client_id, certificate, label) = match args {
+        [id] => (id.as_str(), None, None),
         [id, certificate] => (
             id.as_str(),
             Some(super::device::decode_hex(certificate).map_err(|err| {
                 io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
             })?),
+            None,
+        ),
+        [id, certificate, label] => (
+            id.as_str(),
+            Some(super::device::decode_hex(certificate).map_err(|err| {
+                io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
+            })?),
+            Some(
+                super::device::decode_hex(label)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))
+                    .and_then(|bytes| {
+                        String::from_utf8(bytes).map_err(|err| {
+                            io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
+                        })
+                    })?,
+            ),
         ),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: remote-quic-bootstrap <client-id> [certificate-hex]",
+                "usage: remote-quic-bootstrap <client-id> [certificate-hex] [label-hex]",
             ))
         }
     };
     let logical_client_id = parse_logical_client_id(logical_client_id)?;
     ensure_remote_server_running()?;
     if let Some(certificate) = certificate {
-        let name = device_label();
+        let name = label.unwrap_or_else(device_label);
         match super::device::enroll(&certificate, &name) {
             Ok(true) => tracing::info!(device = %name, "remote QUIC device enrolled"),
             Ok(false) => {}
