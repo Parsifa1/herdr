@@ -1237,12 +1237,7 @@ fn bootstrap_credential(config: &QuicBridgeConfig, key: &CredentialKey) -> Resul
     }
     let candidates =
         remote_quic_candidates(&hostname, record.port).map_err(|err| err.to_string())?;
-    store_credential(
-        &mut lock(&CREDENTIAL_CACHE),
-        key.clone(),
-        record,
-        candidates,
-    );
+    store_credential(&mut lock(&CREDENTIAL_CACHE), key.clone(), record, candidates);
     Ok(())
 }
 
