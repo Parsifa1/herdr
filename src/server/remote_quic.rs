@@ -486,9 +486,6 @@ impl ServerIdentity {
     /// new one. Clients pin the certificate fingerprint, so a per-process
     /// identity would force an SSH bootstrap after every server restart.
     fn load_or_create() -> Result<Self, Box<dyn std::error::Error>> {
-        if cfg!(test) {
-            return Self::generate();
-        }
         let path = crate::config::state_dir().join("remote-quic-identity.json");
         if let Ok(bytes) = std::fs::read(&path) {
             match serde_json::from_slice::<StoredIdentity>(&bytes) {
@@ -573,9 +570,6 @@ fn generate_server_instance_id() -> io::Result<[u8; REMOTE_QUIC_ID_BYTES]> {
 /// Same reasoning as the identity: a fresh instance id invalidates every
 /// capability a client already holds.
 fn load_or_create_server_instance_id() -> io::Result<[u8; REMOTE_QUIC_ID_BYTES]> {
-    if cfg!(test) {
-        return generate_server_instance_id();
-    }
     let path = crate::config::state_dir().join("remote-quic-instance.json");
     if let Ok(bytes) = std::fs::read(&path) {
         if let Ok(stored) = serde_json::from_slice::<StoredServerState>(&bytes) {
@@ -1799,5 +1793,75 @@ mod tests {
         assert_eq!(next.server_instance_id, record.server_instance_id);
         assert_eq!(next.certificate_fingerprint, record.certificate_fingerprint);
         assert_eq!(lock(&resumed.state.tokens).len(), 2);
+    }
+
+    /// Points both XDG roots at a throwaway directory so the identity files a
+    /// test writes never reach the developer's real Herdr state.
+    struct StateRoot {
+        base: std::path::PathBuf,
+        config: Option<std::ffi::OsString>,
+        state: Option<std::ffi::OsString>,
+    }
+
+    impl StateRoot {
+        fn new(name: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "herdr-quicid-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            let config = std::env::var_os("XDG_CONFIG_HOME");
+            let state = std::env::var_os("XDG_STATE_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", base.join("config"));
+            std::env::set_var("XDG_STATE_HOME", base.join("state"));
+            Self { base, config, state }
+        }
+    }
+
+    impl Drop for StateRoot {
+        fn drop(&mut self) {
+            match &self.config {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match &self.state {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[test]
+    fn the_server_identity_survives_a_restart() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _root = StateRoot::new("identity");
+
+        let first = ServerIdentity::load_or_create().expect("mint identity");
+        let second = ServerIdentity::load_or_create().expect("reload identity");
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(first.certificate_der, second.certificate_der);
+        assert_eq!(first.private_key_der, second.private_key_der);
+    }
+
+    #[test]
+    fn the_instance_id_survives_a_restart() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _root = StateRoot::new("instance");
+
+        let first = load_or_create_server_instance_id().expect("mint instance id");
+        let second = load_or_create_server_instance_id().expect("reload instance id");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn an_unparseable_identity_file_mints_a_fresh_one() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _root = StateRoot::new("identity-corrupt");
+        let path = crate::config::state_dir().join("remote-quic-identity.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(ServerIdentity::load_or_create().is_ok());
     }
 }

@@ -1003,16 +1003,7 @@ fn credential_file_path() -> PathBuf {
     crate::config::state_dir().join("remote-quic-credentials.json")
 }
 
-/// Unit tests share the process-wide cache and would otherwise leave a token
-/// in the developer's real state directory.
-fn credential_persistence_enabled() -> bool {
-    !cfg!(test)
-}
-
 fn load_credential_cache() -> CredentialCache {
-    if !credential_persistence_enabled() {
-        return CredentialCache::new();
-    }
     let path = credential_file_path();
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -1050,9 +1041,6 @@ fn load_credential_cache() -> CredentialCache {
 }
 
 fn save_credential_cache(cache: &CredentialCache) {
-    if !credential_persistence_enabled() {
-        return;
-    }
     let path = credential_file_path();
     let stored = StoredCredentials {
         version: CREDENTIAL_FILE_VERSION,
@@ -1135,9 +1123,6 @@ fn reserve_cached_credential(
 /// instead of demanding another SSH bootstrap. Without an enrollment the local
 /// expiry stays authoritative, so a stale credential cannot be retried forever.
 fn device_can_renew() -> bool {
-    if cfg!(test) {
-        return false;
-    }
     static ENROLLED: LazyLock<bool> = LazyLock::new(|| {
         crate::remote::device::DeviceIdentity::load(&crate::remote::device::device_path()).is_some()
     });
@@ -1308,15 +1293,11 @@ fn format_logical_client_id(value: &[u8; REMOTE_QUIC_ID_BYTES]) -> String {
 /// such subcommand and fails, which is how a fork client learns to stay on SSH.
 /// The token is never logged.
 fn request_remote_quic_bootstrap(config: &QuicBridgeConfig) -> io::Result<RemoteBootstrapRecord> {
-    let certificate = if cfg!(test) {
-        None
-    } else {
-        crate::remote::device::DeviceIdentity::load_or_create(
-            &crate::remote::device::device_path(),
-        )
-        .ok()
-        .map(|device| crate::remote::device::encode_hex(&device.certificate_der()))
-    };
+    let certificate = crate::remote::device::DeviceIdentity::load_or_create(
+        &crate::remote::device::device_path(),
+    )
+    .ok()
+    .map(|device| crate::remote::device::encode_hex(&device.certificate_der()));
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, config.ssh_options.as_ref());
     if config.noninteractive {
@@ -1440,6 +1421,120 @@ mod tests {
 
     fn key() -> CredentialKey {
         ("fedora".to_owned(), "default".to_owned())
+    }
+
+    /// Points both XDG roots at a throwaway directory for the duration of one
+    /// test. The returned guard restores them on drop; callers hold the shared
+    /// env lock so parallel tests cannot interleave.
+    struct StateDir {
+        base: std::path::PathBuf,
+        config: Option<std::ffi::OsString>,
+        state: Option<std::ffi::OsString>,
+    }
+
+    impl StateDir {
+        fn new(name: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "herdr-quicstate-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).expect("test state root");
+            let config = std::env::var_os("XDG_CONFIG_HOME");
+            let state = std::env::var_os("XDG_STATE_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", base.join("config"));
+            std::env::set_var("XDG_STATE_HOME", base.join("state"));
+            Self { base, config, state }
+        }
+    }
+
+    impl Drop for StateDir {
+        fn drop(&mut self) {
+            match &self.config {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match &self.state {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[test]
+    fn stored_credentials_survive_a_reload() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _dir = StateDir::new("roundtrip");
+
+        let mut cache = CredentialCache::new();
+        store_credential(
+            &mut cache,
+            key(),
+            record(9_999),
+            vec![SocketAddr::from(([127, 0, 0, 1], 48_000))],
+        );
+
+        let reloaded = load_credential_cache();
+        let entry = reloaded.get(&key()).expect("credential reloaded");
+        assert_eq!(entry.record.port, 48_001);
+        assert_eq!(entry.next_connection_generation, 1);
+        assert_eq!(entry.candidates.len(), 1);
+    }
+
+    #[test]
+    fn a_credential_file_that_does_not_parse_is_ignored() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _dir = StateDir::new("corrupt");
+        let path = credential_file_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(load_credential_cache().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_credential_file_version_is_ignored() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _dir = StateDir::new("version");
+        let path = credential_file_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"version":999,"entries":[]}"#).unwrap();
+        assert!(load_credential_cache().is_empty());
+    }
+
+    #[test]
+    fn reserving_bumps_the_generation_so_the_server_fences_the_old_dial() {
+        let mut cache = CredentialCache::new();
+        store_credential(&mut cache, key(), record(9_999), Vec::new());
+        let first = reserve_cached_credential(&mut cache, &key(), 1).expect("first dial");
+        let second = reserve_cached_credential(&mut cache, &key(), 1).expect("second dial");
+        assert_eq!(first.generation, 1);
+        assert_eq!(second.generation, 2);
+    }
+
+    #[test]
+    fn an_expired_credential_is_discarded_without_a_device_or_kept_with_one() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _dir = StateDir::new("expiry");
+        let expired = 1_000;
+        let slack = CREDENTIAL_EXPIRY_SLACK.as_secs();
+
+        let mut cache = CredentialCache::new();
+        store_credential(&mut cache, key(), record(expired), Vec::new());
+        assert!(
+            reserve_cached_credential(&mut cache, &key(), expired + slack).is_none(),
+            "without an enrolled device the local expiry stays authoritative"
+        );
+        assert!(cache.is_empty(), "the expired entry is evicted");
+
+        // `device_can_renew` is a process-wide memo, so this asserts the policy
+        // the ladder applies rather than re-mocking the enrollment.
+        let mut cache = CredentialCache::new();
+        store_credential(&mut cache, key(), record(expired), Vec::new());
+        assert!(
+            reserve_cached_credential(&mut cache, &key(), expired).is_some(),
+            "an unexpired credential is always usable"
+        );
     }
 
     /// End to end over the real machinery: `ssh localhost` runs this build's

@@ -364,4 +364,30 @@ mod tests {
         assert!(decode_hex("abc").is_err());
         assert!(decode_hex("zz").is_err());
     }
+
+    #[test]
+    fn a_device_key_is_created_once_and_reused() {
+        let dir = std::env::temp_dir().join(format!("herdr-devkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("device.json");
+
+        let first = DeviceIdentity::load_or_create(&path).expect("create device key");
+        let second = DeviceIdentity::load_or_create(&path).expect("reload device key");
+        assert_eq!(first.certificate_der(), second.certificate_der());
+        assert!(!first.certificate_der().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_never_creates_a_device_key() {
+        let dir = std::env::temp_dir().join(format!("herdr-nodevkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("missing.json");
+
+        assert!(DeviceIdentity::load(&path).is_none());
+        assert!(!path.exists(), "a read must not enroll the machine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

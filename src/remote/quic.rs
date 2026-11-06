@@ -883,9 +883,6 @@ fn client_config(fingerprint: [u8; REMOTE_QUIC_HASH_BYTES]) -> Result<quinn::Cli
 /// enrolled: the capability token still authorizes that connection.
 fn device_client_credentials(
 ) -> Option<(Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>)> {
-    if cfg!(test) {
-        return None;
-    }
     let path = crate::remote::device::device_path();
     let identity = crate::remote::device::DeviceIdentity::load(&path)?;
     identity.client_config().ok()
