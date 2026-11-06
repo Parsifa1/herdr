@@ -27,7 +27,10 @@ fn unique_dir(prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("herdr-{prefix}-{}-{nonce}", std::process::id()))
+    // Under /tmp, not temp_dir(): the server binds its socket inside this
+    // path, and sun_path is 108 bytes. A CI TMPDIR like
+    // /home/runner/work/_temp/nix-shell.XXXXXX leaves room for nothing.
+    PathBuf::from("/tmp").join(format!("herdr-{prefix}-{}-{nonce}", std::process::id()))
 }
 
 fn wait_for_file(path: &Path, log: &Path, timeout: Duration) {
