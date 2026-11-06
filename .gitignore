@@ -18,6 +18,8 @@ __pycache__/
 /.local/
 /backlog
 
+/.omp/
+
 /.pi/todos
 /.pi/issues
 /.pi/cache
