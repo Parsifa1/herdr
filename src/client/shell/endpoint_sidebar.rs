@@ -599,7 +599,7 @@ fn render_endpoint_row(
     if highlighted {
         buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
     }
-    let (_glyph, state, color) = endpoint_status_presentation(endpoint.status, palette);
+    let (glyph, state, color) = endpoint_status_presentation(endpoint.status, palette);
     let state = if endpoint.status == ClientEndpointStatus::Online {
         ""
     } else {
@@ -611,8 +611,10 @@ fn render_endpoint_row(
         "! error".to_owned()
     } else if endpoint.endpoint_id.is_local() {
         String::new()
+    } else if state.is_empty() {
+        glyph.to_owned()
     } else {
-        state.to_owned()
+        format!("{glyph} {state}")
     };
     let signal_width = display_width(&signal).min(rect.width);
     put_text(
