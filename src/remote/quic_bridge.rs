@@ -1510,27 +1510,26 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_credential_is_discarded_without_a_device_or_kept_with_one() {
+    fn an_expired_credential_is_evicted_and_a_live_one_is_usable() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("expiry");
-        let expired = 1_000;
+        let expires = 10_000;
         let slack = CREDENTIAL_EXPIRY_SLACK.as_secs();
 
         let mut cache = CredentialCache::new();
-        store_credential(&mut cache, key(), record(expired), Vec::new());
+        store_credential(&mut cache, key(), record(expires), Vec::new());
         assert!(
-            reserve_cached_credential(&mut cache, &key(), expired + slack).is_none(),
+            reserve_cached_credential(&mut cache, &key(), expires + slack).is_none(),
             "without an enrolled device the local expiry stays authoritative"
         );
         assert!(cache.is_empty(), "the expired entry is evicted");
 
-        // `device_can_renew` is a process-wide memo, so this asserts the policy
-        // the ladder applies rather than re-mocking the enrollment.
+        // Same record, one second before the slack window opens: still usable.
         let mut cache = CredentialCache::new();
-        store_credential(&mut cache, key(), record(expired), Vec::new());
+        store_credential(&mut cache, key(), record(expires), Vec::new());
         assert!(
-            reserve_cached_credential(&mut cache, &key(), expired).is_some(),
-            "an unexpired credential is always usable"
+            reserve_cached_credential(&mut cache, &key(), expires - 1).is_some(),
+            "a credential inside its lifetime is usable"
         );
     }
 
