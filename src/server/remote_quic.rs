@@ -1128,6 +1128,73 @@ mod tests {
         assert!(parse_port_range("invalid").is_err());
     }
 
+    /// Writes a device certificate into the server's authorized list under a
+    /// throwaway config root, so the real verifier runs against real files.
+    fn enroll_test_device(name: &str) -> crate::remote::device::DeviceIdentity {
+        let dir = std::env::temp_dir().join(format!("herdr-mtls-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = crate::remote::device::DeviceIdentity::load_or_create(&dir.join("device.json"))
+            .expect("create device identity");
+        crate::remote::device::enroll(&identity.certificate_der(), name).expect("enroll device");
+        let _ = std::fs::remove_dir_all(&dir);
+        identity
+    }
+
+    #[tokio::test]
+    async fn an_enrolled_device_is_accepted_and_a_revoked_one_is_refused() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _root = StateRoot::new("mtls");
+        let TestServer { server, .. } = test_server_on_free_port();
+        let record = mint(&server, 31);
+
+        let identity = enroll_test_device("laptop");
+        let mut client = dial_with_hello_and_device(&record, 31, 1, Some(&identity)).await;
+        let accepted_hello: RemoteQuicAccepted = read_async_message(&mut client.recv, MAX_HELLO_SIZE)
+            .await
+            .expect("an enrolled device is accepted");
+        assert_eq!(accepted_hello.connection_generation, 1);
+        drop(client);
+
+        let mut devices = crate::remote::device::DeviceList::load(&crate::remote::device::devices_path());
+        devices.devices[0].revoked = true;
+        devices
+            .save(&crate::remote::device::devices_path())
+            .expect("save revoked devices");
+
+        let mut revoked = dial_with_hello_and_device(&record, 31, 2, Some(&identity)).await;
+        let refusal = read_async_message::<RemoteQuicAccepted>(&mut revoked.recv, MAX_HELLO_SIZE).await;
+        assert!(refusal.is_err(), "a revoked certificate must not be accepted");
+    }
+
+    #[tokio::test]
+    async fn an_enrolled_device_renews_an_expired_capability() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _root = StateRoot::new("renew");
+        let TestServer { server, .. } = test_server_on_free_port();
+        let record = mint(&server, 32);
+
+        let token_hash = hash_bytes(&record.capability_token);
+        lock(&server.state.tokens)
+            .get_mut(&token_hash)
+            .expect("minted capability")
+            .expires_unix_seconds = 1;
+
+        let identity = enroll_test_device("desktop");
+        let mut client = dial_with_hello_and_device(&record, 32, 1, Some(&identity)).await;
+        let renewed: RemoteQuicAccepted = read_async_message(&mut client.recv, MAX_HELLO_SIZE)
+            .await
+            .expect("an enrolled device renews an expired capability");
+        assert_eq!(renewed.connection_generation, 1);
+        assert!(
+            lock(&server.state.tokens)
+                .get(&token_hash)
+                .is_some_and(|capability| capability.expires_unix_seconds > unix_seconds()),
+            "the stored capability was extended"
+        );
+        drop(client);
+    }
+
     fn capability_fixture() -> (
         [u8; REMOTE_QUIC_ID_BYTES],
         HashMap<[u8; REMOTE_QUIC_HASH_BYTES], Capability>,
@@ -1380,16 +1447,35 @@ mod tests {
         logical_client_id: u8,
         connection_generation: u64,
     ) -> LiveTestClient {
+        dial_with_hello_and_device(record, logical_client_id, connection_generation, None).await
+    }
+
+    /// Same dial, optionally presenting a device certificate so the server's
+    /// client-certificate path is exercised rather than bypassed.
+    async fn dial_with_hello_and_device(
+        record: &RemoteBootstrapRecord,
+        logical_client_id: u8,
+        connection_generation: u64,
+        device: Option<&crate::remote::device::DeviceIdentity>,
+    ) -> LiveTestClient {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .expect("enable TLS 1.3")
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedTestCert {
                 fingerprint: record.certificate_fingerprint,
                 provider,
-            }))
-            .with_no_client_auth();
+            }));
+        let mut tls = match device.and_then(|device| device.client_config().ok()) {
+            Some((certificate, key)) => builder
+                .with_client_auth_cert(
+                    vec![rustls::pki_types::CertificateDer::from(certificate)],
+                    key,
+                )
+                .expect("present device certificate"),
+            None => builder.with_no_client_auth(),
+        };
         tls.alpn_protocols = vec![REMOTE_QUIC_ALPN.to_vec()];
         let crypto =
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC client crypto");
