@@ -30,13 +30,15 @@ fn unique_dir(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("herdr-{prefix}-{}-{nonce}", std::process::id()))
 }
 
-fn wait_for_file(path: &Path, timeout: Duration) {
+fn wait_for_file(path: &Path, log: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while !path.exists() {
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
+            "timed out waiting for {}; log {}:\n{}",
+            path.display(),
+            log.display(),
+            fs::read_to_string(log).unwrap_or_default()
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -177,6 +179,7 @@ fn warm_connection_through_the_daemon_is_faster_than_the_cold_one() {
     )
     .unwrap();
 
+    let server_log = base.join("server.log");
     let server = Command::new("setsid")
         .arg(env!("CARGO_BIN_EXE_herdr"))
         .arg("server")
@@ -191,12 +194,14 @@ fn warm_connection_through_the_daemon_is_faster_than_the_cold_one() {
         .env_remove("HERDR_SESSION")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(
+            fs::File::create(&server_log).expect("create server log"),
+        ))
         .spawn()
         .expect("spawn server");
     cleanup.children.push(server);
-    wait_for_file(&remote_api, Duration::from_secs(10));
-    wait_for_file(&remote_client, Duration::from_secs(10));
+    wait_for_file(&remote_api, &server_log, Duration::from_secs(10));
+    wait_for_file(&remote_client, &server_log, Duration::from_secs(10));
 
     let bin = base.join("bin");
     fs::create_dir_all(&bin).unwrap();
@@ -236,7 +241,7 @@ fn warm_connection_through_the_daemon_is_faster_than_the_cold_one() {
     // Cold: no daemon yet; the client pays SSH discovery and bootstrap.
     let (cold, _cold_master, mut cold_child) =
         timed_client_attach(&path_env, &config_home, &state_home);
-    wait_for_file(&stable_socket, Duration::from_secs(15));
+    wait_for_file(&stable_socket, &ssh_commands, Duration::from_secs(15));
 
     // Warm: the client attaches through the daemon. The freshly spawned
     // daemon still owes its own one-time credential bootstrap, so allow it

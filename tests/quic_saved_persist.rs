@@ -29,13 +29,15 @@ fn unique_dir(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("herdr-{prefix}-{}-{nonce}", std::process::id()))
 }
 
-fn wait_for_file(path: &Path, timeout: Duration) {
+fn wait_for_file(path: &Path, log: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while !path.exists() {
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
+            "timed out waiting for {}; log {}:\n{}",
+            path.display(),
+            log.display(),
+            fs::read_to_string(log).unwrap_or_default()
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -182,6 +184,7 @@ fn saved_endpoint_connections_reuse_the_persisted_bridge_daemon() {
     .unwrap();
 
     // The "remote" machine: a real local herdr server in its own config root.
+    let server_log = base.join("server.log");
     let server = Command::new("setsid")
         .arg(env!("CARGO_BIN_EXE_herdr"))
         .arg("server")
@@ -196,12 +199,14 @@ fn saved_endpoint_connections_reuse_the_persisted_bridge_daemon() {
         .env_remove("HERDR_SESSION")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(
+            fs::File::create(&server_log).expect("create server log"),
+        ))
         .spawn()
         .expect("spawn server");
     cleanup.children.push(server);
-    wait_for_file(&remote_api, Duration::from_secs(10));
-    wait_for_file(&remote_client, Duration::from_secs(10));
+    wait_for_file(&remote_api, &server_log, Duration::from_secs(10));
+    wait_for_file(&remote_client, &server_log, Duration::from_secs(10));
 
     // The fake ssh runs every remote command against that server.
     let bin = base.join("bin");
