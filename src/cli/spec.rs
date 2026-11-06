@@ -44,7 +44,10 @@ pub(super) fn command() -> Command {
         .subcommand(agent_command())
         .subcommand(pane_command())
         .subcommand(terminal_command())
-        .subcommand(session_command())
+        .subcommand(session_command());
+    #[cfg(unix)]
+    let command = command.subcommand(device_command());
+    let command = command
         .subcommand(integration_command())
         .subcommand(plugin_command());
     configure_help(command, 0)
@@ -271,6 +274,18 @@ fn session_command() -> Command {
                 .about("Delete a stopped session")
                 .arg(required("name", "NAME"))
                 .arg(json_flag()),
+        )
+}
+
+#[cfg(unix)]
+fn device_command() -> Command {
+    Command::new("device")
+        .about("Manage devices enrolled for remote QUIC access")
+        .subcommand(Command::new("list").about("List enrolled devices").arg(json_flag()))
+        .subcommand(
+            Command::new("revoke")
+                .about("Revoke an enrolled device")
+                .arg(required("name", "NAME")),
         )
 }
 

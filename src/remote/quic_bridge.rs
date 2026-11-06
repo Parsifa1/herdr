@@ -17,8 +17,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::io::Write as _;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -27,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::ListenerNonblockingMode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 use tracing::{debug, info, warn};
@@ -552,6 +553,7 @@ fn acquire_shared_session(
                 if !sleep_interruptible(delay, should_stop) {
                     return Acquired::Stopped;
                 }
+                let dial_started = Instant::now();
                 let params = QuicClientParams {
                     candidates: dial.candidates.clone(),
                     fingerprint: dial.record.certificate_fingerprint,
@@ -576,6 +578,7 @@ fn acquire_shared_session(
                         info!(
                             target = %config.target,
                             generation = dial.generation,
+                            elapsed_ms = dial_started.elapsed().as_millis() as u64,
                             "remote QUIC transport connected"
                         );
                         mark_credential_proven(key);
@@ -954,6 +957,7 @@ struct Credential {
     proven: bool,
 }
 
+#[derive(Serialize, Deserialize)]
 struct CachedCredential {
     record: RemoteBootstrapRecord,
     candidates: Vec<SocketAddr>,
@@ -968,11 +972,130 @@ struct CachedCredential {
 type CredentialKey = (String, String);
 type CredentialCache = HashMap<CredentialKey, CachedCredential>;
 
-/// Process-wide: a reconnecting thin client opens a fresh local connection, and
-/// the whole point of caching the credential is that the new connection dials
-/// QUIC without another SSH round trip.
+/// Process-wide, and mirrored to disk: a daemon restart must not mint a new
+/// credential over SSH while the server still trusts the old one.
 static CREDENTIAL_CACHE: LazyLock<Mutex<CredentialCache>> =
-    LazyLock::new(|| Mutex::new(CredentialCache::new()));
+    LazyLock::new(|| Mutex::new(load_credential_cache()));
+
+/// Bumped when the on-disk shape changes; an older or newer file is ignored
+/// rather than reinterpreted, and the next bootstrap replaces it.
+const CREDENTIAL_FILE_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct StoredCredential {
+    target: String,
+    session: String,
+    record: RemoteBootstrapRecord,
+    candidates: Vec<SocketAddr>,
+    next_connection_generation: u64,
+    proven: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredCredentials {
+    version: u32,
+    entries: Vec<StoredCredential>,
+}
+
+/// `state_dir()` is resolved per call: tests point `XDG_STATE_HOME` at their
+/// own directory, sometimes after this module has already been used.
+fn credential_file_path() -> PathBuf {
+    crate::config::state_dir().join("remote-quic-credentials.json")
+}
+
+/// Unit tests share the process-wide cache and would otherwise leave a token
+/// in the developer's real state directory.
+fn credential_persistence_enabled() -> bool {
+    !cfg!(test)
+}
+
+fn load_credential_cache() -> CredentialCache {
+    if !credential_persistence_enabled() {
+        return CredentialCache::new();
+    }
+    let path = credential_file_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return CredentialCache::new(),
+        Err(err) => {
+            debug!(path = %path.display(), error = %err, "remote QUIC credential cache not read");
+            return CredentialCache::new();
+        }
+    };
+    let stored: StoredCredentials = match serde_json::from_slice(&bytes) {
+        Ok(stored) => stored,
+        Err(err) => {
+            debug!(path = %path.display(), error = %err, "remote QUIC credential cache not parsed");
+            return CredentialCache::new();
+        }
+    };
+    if stored.version != CREDENTIAL_FILE_VERSION {
+        return CredentialCache::new();
+    }
+    stored
+        .entries
+        .into_iter()
+        .map(|entry| {
+            (
+                (entry.target, entry.session),
+                CachedCredential {
+                    record: entry.record,
+                    candidates: entry.candidates,
+                    next_connection_generation: entry.next_connection_generation,
+                    proven: entry.proven,
+                },
+            )
+        })
+        .collect()
+}
+
+fn save_credential_cache(cache: &CredentialCache) {
+    if !credential_persistence_enabled() {
+        return;
+    }
+    let path = credential_file_path();
+    let stored = StoredCredentials {
+        version: CREDENTIAL_FILE_VERSION,
+        entries: cache
+            .iter()
+            .map(|((target, session), entry)| StoredCredential {
+                target: target.clone(),
+                session: session.clone(),
+                record: entry.record.clone(),
+                candidates: entry.candidates.clone(),
+                next_connection_generation: entry.next_connection_generation,
+                proven: entry.proven,
+            })
+            .collect(),
+    };
+    if let Err(err) = write_private_json(&path, &stored) {
+        debug!(path = %path.display(), error = %err, "remote QUIC credential cache not saved");
+    }
+}
+
+/// The file holds a bearer token, so it is private and replaced atomically: a
+/// daemon killed mid-write must leave the previous cache intact, never a
+/// truncated one.
+fn write_private_json(path: &Path, value: &StoredCredentials) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temporary, path)
+}
 
 fn credential_key(config: &QuicBridgeConfig) -> CredentialKey {
     (config.target.clone(), config.session.clone())
@@ -989,18 +1112,36 @@ fn reserve_cached_credential(
     let entry = cache.get_mut(key)?;
     if entry.record.expires_unix_seconds
         <= now_unix.saturating_add(CREDENTIAL_EXPIRY_SLACK.as_secs())
+        && !device_can_renew()
     {
         cache.remove(key);
+        save_credential_cache(cache);
         return None;
     }
     let generation = entry.next_connection_generation;
     entry.next_connection_generation = generation.saturating_add(1);
-    Some(Credential {
+    let credential = Credential {
         record: entry.record.clone(),
         candidates: entry.candidates.clone(),
         generation,
         proven: entry.proven,
-    })
+    };
+    save_credential_cache(cache);
+    Some(credential)
+}
+
+/// An expired credential is still worth dialing when this machine enrolled a
+/// device: the server renews it on the strength of the device certificate
+/// instead of demanding another SSH bootstrap. Without an enrollment the local
+/// expiry stays authoritative, so a stale credential cannot be retried forever.
+fn device_can_renew() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    static ENROLLED: LazyLock<bool> = LazyLock::new(|| {
+        crate::remote::device::DeviceIdentity::load(&crate::remote::device::device_path()).is_some()
+    });
+    *ENROLLED
 }
 
 fn store_credential(
@@ -1018,16 +1159,27 @@ fn store_credential(
             proven: false,
         },
     );
+    save_credential_cache(cache);
 }
 
 fn mark_credential_proven(key: &CredentialKey) {
-    if let Some(entry) = lock(&CREDENTIAL_CACHE).get_mut(key) {
-        entry.proven = true;
+    let mut cache = lock(&CREDENTIAL_CACHE);
+    let Some(entry) = cache.get_mut(key) else {
+        return;
+    };
+    if entry.proven {
+        return;
     }
+    entry.proven = true;
+    drop(entry);
+    save_credential_cache(&cache);
 }
 
 fn drop_credential(key: &CredentialKey) {
-    lock(&CREDENTIAL_CACHE).remove(key);
+    let mut cache = lock(&CREDENTIAL_CACHE);
+    if cache.remove(key).is_some() {
+        save_credential_cache(&cache);
+    }
 }
 
 /// Plant a credential so the next local connection dials QUIC straight away.
@@ -1069,8 +1221,14 @@ fn credential(config: &QuicBridgeConfig, key: &CredentialKey) -> Result<Credenti
 
 /// Mint a credential over the authenticated SSH path and cache it.
 fn bootstrap_credential(config: &QuicBridgeConfig, key: &CredentialKey) -> Result<(), String> {
+    let started = Instant::now();
     let hostname = resolve_ssh_hostname(config).map_err(|err| err.to_string())?;
     let record = request_remote_quic_bootstrap(config).map_err(|err| err.to_string())?;
+    info!(
+        target = %config.target,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "remote QUIC credential bootstrapped over SSH"
+    );
     if record.schema_version != REMOTE_QUIC_SCHEMA_VERSION {
         return Err(format!(
             "remote QUIC bootstrap schema {} is not {REMOTE_QUIC_SCHEMA_VERSION}",
@@ -1123,20 +1281,24 @@ fn now_unix() -> u64 {
 // SSH bootstrap
 // ---------------------------------------------------------------------------
 
-/// `herdr [--session S] remote-quic-bootstrap <client id>` on the remote host.
+/// `herdr [--session S] remote-quic-bootstrap <client id> [certificate-hex]`
+/// on the remote host. The certificate argument enrolls this device so later
+/// connections can authenticate without SSH.
 fn remote_quic_bootstrap_command(
     remote_herdr: &RemoteHerdr,
     session: &str,
     logical_client_id: &[u8; REMOTE_QUIC_ID_BYTES],
+    certificate: Option<&str>,
 ) -> String {
-    remote_session_command(
-        remote_herdr,
-        session,
-        &format!(
-            "remote-quic-bootstrap {}",
-            format_logical_client_id(logical_client_id)
-        ),
-    )
+    let mut command = format!(
+        "remote-quic-bootstrap {}",
+        format_logical_client_id(logical_client_id)
+    );
+    if let Some(certificate) = certificate {
+        command.push(' ');
+        command.push_str(certificate);
+    }
+    remote_session_command(remote_herdr, session, &command)
 }
 
 fn format_logical_client_id(value: &[u8; REMOTE_QUIC_ID_BYTES]) -> String {
@@ -1152,6 +1314,15 @@ fn format_logical_client_id(value: &[u8; REMOTE_QUIC_ID_BYTES]) -> String {
 /// such subcommand and fails, which is how a fork client learns to stay on SSH.
 /// The token is never logged.
 fn request_remote_quic_bootstrap(config: &QuicBridgeConfig) -> io::Result<RemoteBootstrapRecord> {
+    let certificate = if cfg!(test) {
+        None
+    } else {
+        crate::remote::device::DeviceIdentity::load_or_create(
+            &crate::remote::device::device_path(),
+        )
+        .ok()
+        .map(|device| crate::remote::device::encode_hex(&device.certificate_der()))
+    };
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, config.ssh_options.as_ref());
     if config.noninteractive {
@@ -1164,6 +1335,7 @@ fn request_remote_quic_bootstrap(config: &QuicBridgeConfig) -> io::Result<Remote
             &config.remote_herdr,
             &config.session,
             &config.logical_client_id,
+            certificate.as_deref(),
         ))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

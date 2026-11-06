@@ -37,15 +37,41 @@ pub(crate) fn run_remote_client_bridge(args: &[String]) -> io::Result<()> {
     crate::platform::forward_remote_bridge_stdio(stream, idle_timeout)
 }
 
-/// `herdr remote-quic-bootstrap <client-id>`: ask the local server for a QUIC
-/// credential on behalf of the SSH-authenticated caller and print it as JSON.
-/// The caller's SSH session is the authentication; this helper only relays.
+/// `herdr remote-quic-bootstrap <client-id> [certificate-hex]`: ask the local
+/// server for a QUIC credential on behalf of the SSH-authenticated caller and
+/// print it as JSON. The caller's SSH session is the authentication; this
+/// helper only relays. A certificate argument enrolls that device, which is
+/// what lets it reconnect later without SSH.
 #[cfg(unix)]
-pub(crate) fn run_remote_quic_bootstrap(logical_client_id: Option<&str>) -> io::Result<()> {
-    let logical_client_id = logical_client_id
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing logical client id"))
-        .and_then(parse_logical_client_id)?;
+pub(crate) fn run_remote_quic_bootstrap(args: &[String]) -> io::Result<()> {
+    let (logical_client_id, certificate) = match args {
+        [id] => (id.as_str(), None),
+        [id, certificate] => (
+            id.as_str(),
+            Some(super::device::decode_hex(certificate).map_err(|err| {
+                io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
+            })?),
+        ),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: remote-quic-bootstrap <client-id> [certificate-hex]",
+            ))
+        }
+    };
+    let logical_client_id = parse_logical_client_id(logical_client_id)?;
     ensure_remote_server_running()?;
+    if let Some(certificate) = certificate {
+        let name = device_label();
+        match super::device::enroll(&certificate, &name) {
+            Ok(true) => tracing::info!(device = %name, "remote QUIC device enrolled"),
+            Ok(false) => {}
+            Err(err) => {
+                // Enrollment failing must not cost the caller its credential.
+                tracing::warn!(error = %err, "remote QUIC device enrollment failed");
+            }
+        }
+    }
 
     let socket_path = crate::server::socket_paths::client_socket_path();
     let mut stream = crate::ipc::connect_local_stream(&socket_path).map_err(|err| {
@@ -84,6 +110,15 @@ pub(crate) fn run_remote_quic_bootstrap(logical_client_id: Option<&str>) -> io::
         .map_err(|err| io::Error::other(format!("failed to encode QUIC bootstrap: {err}")))?;
     println!();
     Ok(())
+}
+
+/// The enrolling machine's own name, so `herdr device list` is readable and
+/// `revoke` has something to type.
+#[cfg(unix)]
+fn device_label() -> String {
+    crate::platform::hostname()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned())
 }
 
 #[cfg(unix)]

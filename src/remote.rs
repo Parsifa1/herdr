@@ -4,6 +4,8 @@ mod attach;
 mod benchmark;
 #[cfg(unix)]
 pub(crate) mod frame;
+#[cfg(unix)]
+pub(crate) mod device;
 mod host;
 mod process;
 #[cfg(unix)]
@@ -29,7 +31,7 @@ pub(crate) use quic_saved::run_remote_bridge_daemon;
 pub(crate) use saved::*;
 
 #[cfg(windows)]
-pub(crate) fn run_remote_quic_bootstrap(_logical_client_id: Option<&str>) -> std::io::Result<()> {
+pub(crate) fn run_remote_quic_bootstrap(_args: &[String]) -> std::io::Result<()> {
     Err(std::io::Error::other(
         "remote Windows hosts are not supported yet",
     ))

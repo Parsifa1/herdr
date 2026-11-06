@@ -87,6 +87,8 @@ struct ServerState {
     server_instance_id: [u8; REMOTE_QUIC_ID_BYTES],
     tokens: Mutex<HashMap<[u8; REMOTE_QUIC_HASH_BYTES], Capability>>,
     token_order: AtomicU64,
+    /// Lifetimes are a config value, fixed for the life of the process.
+    token_lifetime: Duration,
     /// The single session this server process owns. A capability minted for
     /// another session never validates here.
     active_session: String,
@@ -118,8 +120,8 @@ impl RemoteQuicServer {
     ) -> io::Result<Self> {
         let (start_port, end_port) = parse_port_range(&config.quic_port_range)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-        let identity = ServerIdentity::generate().map_err(|err| {
-            io::Error::other(format!("failed to mint remote QUIC identity: {err}"))
+        let identity = ServerIdentity::load_or_create().map_err(|err| {
+            io::Error::other(format!("failed to load remote QUIC identity: {err}"))
         })?;
         let server_config =
             make_server_config(&identity, config.validated_transport_idle_timeout()).map_err(
@@ -133,14 +135,12 @@ impl RemoteQuicServer {
         let (sockets, port) = bind_sockets(start_port, end_port)?;
         let endpoints = make_endpoints(&server_config, &sockets)?;
 
-        let mut server_instance_id = [0u8; REMOTE_QUIC_ID_BYTES];
-        getrandom::fill(&mut server_instance_id).map_err(|err| {
-            io::Error::other(format!("failed to generate QUIC server instance id: {err}"))
-        })?;
+        let server_instance_id = load_or_create_server_instance_id()?;
         let state = Arc::new(ServerState {
             server_instance_id,
             tokens: Mutex::new(HashMap::new()),
             token_order: AtomicU64::new(1),
+            token_lifetime: token_lifetime(config),
             active_session,
             sink,
         });
@@ -238,6 +238,7 @@ impl RemoteQuicServer {
             server_instance_id: state.server_instance_id,
             tokens: Mutex::new(tokens),
             token_order: AtomicU64::new(token_order),
+            token_lifetime: token_lifetime(config),
             active_session,
             sink,
         });
@@ -480,6 +481,116 @@ impl ServerIdentity {
             private_key_der: signing_key.serialize_der(),
         })
     }
+
+    /// Reload the identity a previous process persisted, or mint and store a
+    /// new one. Clients pin the certificate fingerprint, so a per-process
+    /// identity would force an SSH bootstrap after every server restart.
+    fn load_or_create() -> Result<Self, Box<dyn std::error::Error>> {
+        if cfg!(test) {
+            return Self::generate();
+        }
+        let path = crate::config::state_dir().join("remote-quic-identity.json");
+        if let Ok(bytes) = std::fs::read(&path) {
+            match serde_json::from_slice::<StoredIdentity>(&bytes) {
+                Ok(stored) => {
+                    return Ok(Self {
+                        fingerprint: hash_bytes(&stored.certificate_der),
+                        certificate_der: stored.certificate_der,
+                        private_key_der: stored.private_key_der,
+                    })
+                }
+                Err(err) => debug!(
+                    path = %path.display(),
+                    error = %err,
+                    "remote QUIC identity not parsed; minting a new one"
+                ),
+            }
+        }
+        let identity = Self::generate()?;
+        identity.store(&path);
+        Ok(identity)
+    }
+
+    fn store(&self, path: &std::path::Path) {
+        let stored = StoredIdentity {
+            certificate_der: self.certificate_der.clone(),
+            private_key_der: self.private_key_der.clone(),
+        };
+        if let Err(err) = write_private_json(path, &stored) {
+            debug!(
+                path = %path.display(),
+                error = %err,
+                "remote QUIC identity not persisted; clients will rebootstrap after a restart"
+            );
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredIdentity {
+    certificate_der: Vec<u8>,
+    private_key_der: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredServerState {
+    server_instance_id: [u8; REMOTE_QUIC_ID_BYTES],
+}
+
+/// The private key and the instance id are the two things a client's cached
+/// credential and pinned fingerprint depend on, so both are private files
+/// replaced atomically.
+fn write_private_json<T: Serialize>(path: &std::path::Path, value: &T) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temporary, path)
+}
+
+fn generate_server_instance_id() -> io::Result<[u8; REMOTE_QUIC_ID_BYTES]> {
+    let mut server_instance_id = [0u8; REMOTE_QUIC_ID_BYTES];
+    getrandom::fill(&mut server_instance_id).map_err(|err| {
+        io::Error::other(format!("failed to generate QUIC server instance id: {err}"))
+    })?;
+    Ok(server_instance_id)
+}
+
+/// Same reasoning as the identity: a fresh instance id invalidates every
+/// capability a client already holds.
+fn load_or_create_server_instance_id() -> io::Result<[u8; REMOTE_QUIC_ID_BYTES]> {
+    if cfg!(test) {
+        return generate_server_instance_id();
+    }
+    let path = crate::config::state_dir().join("remote-quic-instance.json");
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(stored) = serde_json::from_slice::<StoredServerState>(&bytes) {
+            return Ok(stored.server_instance_id);
+        }
+    }
+    let server_instance_id = generate_server_instance_id()?;
+    if let Err(err) = write_private_json(&path, &StoredServerState { server_instance_id }) {
+        debug!(
+            path = %path.display(),
+            error = %err,
+            "remote QUIC instance id not persisted; clients will rebootstrap after a restart"
+        );
+    }
+    Ok(server_instance_id)
 }
 
 fn make_server_config(
@@ -488,8 +599,9 @@ fn make_server_config(
 ) -> Result<quinn::ServerConfig, Box<dyn std::error::Error>> {
     let cert_der = rustls::pki_types::CertificateDer::from(identity.certificate_der.clone());
     let key = rustls::pki_types::PrivatePkcs8KeyDer::from(identity.private_key_der.clone()).into();
+    let verifier = Arc::new(crate::remote::device::DeviceCertVerifier::new());
     let mut tls = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+        .with_client_cert_verifier(verifier)
         .with_single_cert(vec![cert_der], key)?;
     tls.alpn_protocols = vec![REMOTE_QUIC_ALPN.to_vec()];
     tls.max_early_data_size = 0;
@@ -877,23 +989,49 @@ fn validate_and_fence(
     connection: &Connection,
     hello: &RemoteQuicHello,
 ) -> Result<ConnectionFence, String> {
+    let now = unix_seconds();
     let mut tokens = lock(&state.tokens);
+    if let Some(certificate) = presented_device(connection) {
+        // A device that presents a certificate is identified by it: an
+        // unenrolled or revoked one is refused outright, even holding a token
+        // it obtained before revocation.
+        if !crate::remote::device::DeviceList::load(&crate::remote::device::devices_path())
+            .contains(&certificate)
+        {
+            let detail = "remote device certificate is not authorized";
+            connection.close(
+                VarInt::from_u32(REMOTE_QUIC_CLOSE_AUTH),
+                detail.as_bytes(),
+            );
+            return Err(detail.to_owned());
+        }
+    }
     let token_hash = match validate_capability(
         state.server_instance_id,
         &tokens,
         hello,
         &state.active_session,
-        unix_seconds(),
+        now,
     ) {
         Ok(token_hash) => token_hash,
         Err(error) => {
-            // Every validation failure means the credential presented cannot
-            // be used again, so the client is sent back to SSH bootstrap.
-            connection.close(
-                VarInt::from_u32(REMOTE_QUIC_CLOSE_AUTH),
-                error.to_string().as_bytes(),
-            );
-            return Err(error.to_string());
+            // An expired capability from an authenticated device is renewed
+            // instead: the device key is the durable identity, so asking the
+            // user's SSH session again would defeat the enrollment. Any other
+            // failure is a real mismatch and stays fatal.
+            let renewed = matches!(error, CapabilityValidationError::Expired)
+                .then(|| renew_device_capability(state, connection, hello, &mut *tokens, now))
+                .flatten();
+            match renewed {
+                Some(token_hash) => token_hash,
+                None => {
+                    connection.close(
+                        VarInt::from_u32(REMOTE_QUIC_CLOSE_AUTH),
+                        error.to_string().as_bytes(),
+                    );
+                    return Err(error.to_string());
+                }
+            }
         }
     };
     let Some(capability) = tokens.get_mut(&token_hash) else {
@@ -909,6 +1047,60 @@ fn validate_and_fence(
     Ok(ConnectionFence {
         token_hash,
         connection_generation: hello.connection_generation,
+    })
+}
+
+/// Re-issues a capability for a device that authenticated with TLS, but only
+/// when every scope check except expiry already passes: an expired token must
+/// not be a skeleton key for a different session or a different device.
+fn renew_device_capability(
+    state: &ServerState,
+    connection: &Connection,
+    hello: &RemoteQuicHello,
+    tokens: &mut HashMap<[u8; REMOTE_QUIC_HASH_BYTES], Capability>,
+    now: u64,
+) -> Option<[u8; REMOTE_QUIC_HASH_BYTES]> {
+    if !connection_has_enrolled_device(connection) {
+        return None;
+    }
+    if hello.server_instance_id != state.server_instance_id {
+        return None;
+    }
+    let token_hash = hash_bytes(&hello.capability_token);
+    let capability = tokens.get_mut(&token_hash)?;
+    if capability.logical_client_id != hello.logical_client_id
+        || capability.session != state.active_session
+        || hello.connection_generation <= capability.connection_generation
+    {
+        return None;
+    }
+    capability.expires_unix_seconds = now.saturating_add(state.token_lifetime.as_secs());
+    let session = capability.session.clone();
+    info!(
+        session = %session,
+        "remote QUIC capability renewed for an enrolled device"
+    );
+    Some(token_hash)
+}
+
+fn presented_device(connection: &Connection) -> Option<Vec<u8>> {
+    connection
+        .peer_identity()
+        .and_then(|identity| {
+            identity
+                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .ok()
+        })
+        .and_then(|certificates| certificates.first().map(|certificate| certificate.to_vec()))
+}
+
+/// Whether the TLS handshake carried a client certificate the verifier
+/// accepted. quinn exposes it only after the handshake, which is why the
+/// renewal path re-checks instead of trusting the verifier's silence.
+fn connection_has_enrolled_device(connection: &Connection) -> bool {
+    presented_device(connection).is_some_and(|certificate| {
+        crate::remote::device::DeviceList::load(&crate::remote::device::devices_path())
+            .contains(&certificate)
     })
 }
 

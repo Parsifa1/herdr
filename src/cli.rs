@@ -22,6 +22,8 @@ macro_rules! println {
 pub(crate) mod agent;
 mod api;
 mod completion;
+#[cfg(unix)]
+mod device;
 mod integration;
 mod machine;
 pub(crate) mod notification;
@@ -124,6 +126,8 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "config" => run_config_command(&args[2..])?,
         "channel" => run_channel_command(&args[2..])?,
         "machine" => machine::run_machine_command(&args[2..])?,
+        #[cfg(unix)]
+        "device" => device::run_device_command(&args[2..])?,
         "workspace" => workspace::run_workspace_command(&args[2..])?,
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,

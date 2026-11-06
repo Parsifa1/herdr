@@ -577,7 +577,7 @@ fn main() -> io::Result<()> {
         return remote::run_remote_client_bridge(&args[2..]);
     }
     if args.get(1).map(|s| s.as_str()) == Some("remote-quic-bootstrap") {
-        return remote::run_remote_quic_bootstrap(args.get(2).map(String::as_str));
+        return remote::run_remote_quic_bootstrap(&args[2..]);
     }
     #[cfg(unix)]
     if args.get(1).map(|s| s.as_str()) == Some("remote-bridge-daemon") {

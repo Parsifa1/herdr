@@ -820,12 +820,20 @@ fn client_config(fingerprint: [u8; REMOTE_QUIC_HASH_BYTES]) -> Result<quinn::Cli
         fingerprint,
         provider: Arc::clone(&provider),
     });
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|err| format!("failed to enable TLS 1.3: {err}"))?
         .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(verifier);
+    let mut tls = match device_client_credentials() {
+        Some((certificate, key)) => builder
+            .with_client_auth_cert(
+                vec![rustls::pki_types::CertificateDer::from(certificate)],
+                key,
+            )
+            .map_err(|err| format!("failed to present the device certificate: {err}"))?,
+        None => builder.with_no_client_auth(),
+    };
     tls.alpn_protocols = vec![REMOTE_QUIC_ALPN.to_vec()];
     tls.enable_early_data = false;
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
@@ -869,6 +877,18 @@ fn client_config(fingerprint: [u8; REMOTE_QUIC_HASH_BYTES]) -> Result<quinn::Cli
         }));
     config.transport_config(Arc::new(transport));
     Ok(config)
+}
+
+/// The enrolled device's credentials, or nothing when this machine has not
+/// enrolled: the capability token still authorizes that connection.
+fn device_client_credentials(
+) -> Option<(Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>)> {
+    if cfg!(test) {
+        return None;
+    }
+    let path = crate::remote::device::device_path();
+    let identity = crate::remote::device::DeviceIdentity::load(&path)?;
+    identity.client_config().ok()
 }
 
 /// Accepts exactly one certificate: the one whose DER hashes to the
