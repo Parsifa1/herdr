@@ -6,7 +6,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const DEVICE_FILE: &str = "remote-quic-device.json";
@@ -41,7 +41,7 @@ impl DeviceIdentity {
     }
 
     fn create() -> io::Result<Self> {
-        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        let key = KeyPair::generate_for(&PKCS_ED25519)
             .map_err(|err| io::Error::other(err.to_string()))?;
         let params = CertificateParams::new(vec!["herdr-device".to_owned()])
             .map_err(|err| io::Error::other(err.to_string()))?;
