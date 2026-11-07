@@ -389,6 +389,16 @@ impl HeadlessServer {
             .collect::<Vec<_>>();
         crate::server::clipboard_image::remove_files(staged_files);
 
+        #[cfg(unix)]
+        if let Some(server) = self.remote_quic.as_ref() {
+            server.close_for_shutdown();
+            info!("closed remote QUIC endpoints for shutdown");
+            // The process exits moments after this returns, so the endpoint
+            // driver never gets to write the close frames on its own. Remote
+            // clients would then wait out ROAMING_GRACE before reconnecting.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
         // Remove socket files.
         self.cleanup_sockets()?;
 

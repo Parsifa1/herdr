@@ -1777,6 +1777,34 @@ mod tests {
         assert!(first.connection.close_reason().is_none());
     }
 
+    /// A graceful shutdown closes every endpoint, so a remote client learns it
+    /// must bootstrap again instead of waiting out `ROAMING_GRACE` on a path
+    /// nothing will ever answer.
+    #[tokio::test]
+    async fn a_shutdown_tells_live_connections_the_server_is_leaving() {
+        let TestServer {
+            server,
+            mut accepted,
+        } = test_server_on_free_port();
+        let record = mint(&server, 25);
+        let mut client = connect_live_test_client(&record, 25, 1).await;
+        client
+            .send
+            .write_all(b"x")
+            .await
+            .expect("wake the accept loop");
+        let _socket = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
+            .await
+            .expect("client reaches the acceptor")
+            .expect("sink channel open");
+
+        server.close_for_shutdown();
+        assert_eq!(
+            closed_code(&client.connection).await,
+            u64::from(REMOTE_QUIC_CLOSE_SHUTDOWN)
+        );
+    }
+
     /// Eviction removes the capability itself, so the token the client holds
     /// can never validate again: it has to bootstrap a new one.
     #[tokio::test]
