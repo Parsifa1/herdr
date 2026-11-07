@@ -131,6 +131,7 @@ pub(crate) fn run_remote_bridge_daemon(args: &[String]) -> io::Result<()> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
     crate::logging::init_file_logging("herdr-remote-bridge-daemon.log");
+    crate::remote::quic_bridge::mark_process_start();
 
     let ssh = validated_saved_ssh(profile_id, target, session)?;
     // Probing the remote host costs two SSH round trips, and driving a remote

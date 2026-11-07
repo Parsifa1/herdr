@@ -1257,8 +1257,16 @@ fn now_unix() -> u64 {
 /// Milliseconds since this process started, so a cold-start log line says how
 /// much of the delay belongs to the bridge rather than to the dial.
 fn process_uptime_ms() -> u64 {
-    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-    START.elapsed().as_millis() as u64
+    START_AT.elapsed().as_millis() as u64
+}
+
+static START_AT: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Anchors [`START_AT`] at process start. The lazy default would otherwise be
+/// initialised by the first connection that reads it, which reports zero and
+/// measures nothing.
+pub(crate) fn mark_process_start() {
+    LazyLock::force(&START_AT);
 }
 
 // ---------------------------------------------------------------------------
@@ -1520,6 +1528,21 @@ mod tests {
         assert!(
             second >= first,
             "the baseline is a single process-wide instant, never re-read: {first} then {second}"
+        );
+    }
+
+    /// The lazy default would be initialised by whichever connection first
+    /// reads it, so every cold-start line would report zero.
+    #[test]
+    fn marking_the_process_start_backdates_the_baseline() {
+        let before_mark = process_uptime_ms();
+        std::thread::sleep(Duration::from_millis(20));
+        mark_process_start();
+        let after_mark = process_uptime_ms();
+        assert!(
+            after_mark < before_mark,
+            "marking must move the baseline to an instant earlier than the first read: \
+             {before_mark} then {after_mark}"
         );
     }
 

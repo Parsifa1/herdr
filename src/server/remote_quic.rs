@@ -728,13 +728,12 @@ async fn accept_connections(endpoint: Endpoint, state: Arc<ServerState>) {
         };
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            let _permit = permit;
             match incoming.await {
                 Ok(connection) => {
                     // Every failure path inside `serve_connection` closes with
                     // the code the client needs to act on, so there is nothing
                     // left to decide here.
-                    if let Err(err) = serve_connection(connection.clone(), state).await {
+                    if let Err(err) = serve_connection(connection.clone(), state, permit).await {
                         debug!(err = %err, remote = %connection.remote_address(), "remote QUIC connection ended");
                     }
                 }
@@ -744,7 +743,11 @@ async fn accept_connections(endpoint: Endpoint, state: Arc<ServerState>) {
     }
 }
 
-async fn serve_connection(connection: Connection, state: Arc<ServerState>) -> Result<(), String> {
+async fn serve_connection(
+    connection: Connection,
+    state: Arc<ServerState>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<(), String> {
     let (send, recv, hello) = match accept_hello(&connection).await {
         Ok(accepted) => accepted,
         Err(err) => {
@@ -757,6 +760,11 @@ async fn serve_connection(connection: Connection, state: Arc<ServerState>) -> Re
     };
 
     let fence = validate_and_fence(&state, &connection, &hello)?;
+    // The admission cap exists to bound work an *unauthenticated* peer can
+    // start, so it ends here. Holding it for the connection's life turns the
+    // cap into a limit on live sessions: a reconnect storm would occupy every
+    // permit with already-trusted connections and refuse the next one.
+    drop(permit);
     // Reply on the hello stream before it becomes the liveness channel; a
     // session then rides on its own stream, opened by the bridge.
     let mut control_send = send;
@@ -1381,6 +1389,48 @@ mod tests {
         assert_eq!(
             validate_capability(server_instance_id, &tokens, &hello, TEST_SESSION, 1_000),
             Err(CapabilityValidationError::StaleGeneration)
+        );
+    }
+
+    /// The admission cap bounds work an unauthenticated peer can start. Once a
+    /// connection authenticates, its permit must stop counting: otherwise a
+    /// reconnect storm holds every permit with trusted connections and the
+    /// next client is refused with "server refused to accept a new connection".
+    #[tokio::test]
+    async fn authenticated_connections_do_not_exhaust_the_admission_cap() {
+        let TestServer {
+            server,
+            mut accepted,
+        } = test_server_on_free_port();
+
+        // More live connections than the pre-auth cap. Each one authenticates
+        // and then idles, which is exactly the shape of a bridge that keeps
+        // reconnecting.
+        let mut clients = Vec::new();
+        for index in 0..(MAX_PREAUTH_CONNECTIONS + 4) {
+            let logical_client_id = u8::try_from(index % 200).expect("id fits a byte");
+            let record = mint(&server, logical_client_id);
+            let mut client =
+                dial_with_hello_and_device(&record, logical_client_id, 1, None).await;
+            let accepted_hello: RemoteQuicAccepted =
+                read_async_message(&mut client.recv, MAX_HELLO_SIZE)
+                    .await
+                    .expect("an authenticated connection is accepted");
+            assert_eq!(accepted_hello.connection_generation, 1);
+            client
+                .send
+                .write_all(b"x")
+                .await
+                .expect("wake the accept loop");
+            let _socket = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
+                .await
+                .expect("client reaches the acceptor")
+                .expect("sink channel open");
+            clients.push(client);
+        }
+        assert!(
+            clients.len() > MAX_PREAUTH_CONNECTIONS,
+            "the test must exceed the pre-auth cap to prove it is released"
         );
     }
 
