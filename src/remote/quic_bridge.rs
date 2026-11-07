@@ -1572,6 +1572,21 @@ mod tests {
     }
 
     #[test]
+    fn a_proven_credential_stays_proven_across_a_locked_rewrite() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _dir = StateDir::new("proven");
+        let other = ("debian".to_owned(), "default".to_owned());
+        store_credential(key(), record(9_999), Vec::new());
+        mark_credential_proven(&key());
+        // A second daemon writing its own row must not reset the first's flag.
+        store_credential(other.clone(), record(9_999), Vec::new());
+
+        let cache = load_credential_cache();
+        assert!(cache.get(&key()).expect("first entry").proven);
+        assert!(!cache.get(&other).expect("second entry").proven);
+    }
+
+    #[test]
     fn a_credential_file_that_does_not_parse_is_ignored() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("corrupt");
