@@ -1,11 +1,19 @@
-//! Contract test proving the persisted bridge daemon makes a saved SSH
-//! endpoint stop paying for SSH: the first (cold) client runs SSH discovery
-//! and bootstrap, the second (warm) client attaches through the daemon, and
-//! the steady-state client adds no SSH commands at all.
+//! End-to-end cold-start test for a saved SSH endpoint.
 //!
-//! It asserts on the SSH command log rather than on wall-clock time. The
-//! client's own startup dominates that number on a loaded runner, so a
-//! comparison between two attaches measures noise, not the daemon.
+//! It drives the real binary the way a user does: a headless client attaches
+//! through a PTY, spawns the persisted bridge daemon, and gets a rendered
+//! screen back. Only SSH is faked, so the test can count every command and
+//! point the hostname at the loopback address the real server binds.
+//!
+//! It covers both halves of the contract:
+//!
+//! - cold: no daemon yet, so the client pays SSH discovery and bootstrap;
+//! - warm and steady: the daemon already holds a QUIC session, so later
+//!   attaches add no SSH commands at all and ride the same connection.
+//!
+//! Assertions are on the SSH log and the daemon log rather than wall-clock
+//! time: client startup dominates that number on a loaded runner, so timing
+//! two attaches measures noise, not the daemon.
 
 #![cfg(unix)]
 
@@ -68,6 +76,17 @@ fn ssh_command_count(path: &Path) -> usize {
     fs::read_to_string(path)
         .map(|text| text.lines().filter(|line| !line.is_empty()).count())
         .unwrap_or(0)
+}
+
+/// A UDP port the remote server can bind for QUIC. The probe socket closes
+/// before the server starts, so the only guarantee is that the port was free a
+/// moment ago.
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("bind a UDP port probe")
+        .local_addr()
+        .expect("probe address")
+        .port()
 }
 
 struct TestCleanup {
@@ -152,7 +171,7 @@ fn timed_client_attach(
 }
 
 #[test]
-fn warm_connection_through_the_daemon_stops_running_ssh() {
+fn cold_start_bootstraps_over_ssh_then_the_daemon_serves_the_rest() {
     let base = unique_dir("quic-timing");
     fs::create_dir_all(&base).expect("create base");
     let temp_dir = base.join("tmp");
@@ -169,6 +188,7 @@ fn warm_connection_through_the_daemon_stops_running_ssh() {
     let remote_api = remote_runtime.join("herdr.sock");
     let remote_client = remote_runtime.join("herdr-client.sock");
     let home = base.join("home");
+    let quic_port = free_udp_port();
     fs::create_dir_all(config_home.join("herdr-dev")).unwrap();
     fs::create_dir_all(state_home.join("herdr-dev").join("client")).unwrap();
     fs::create_dir_all(remote_config.join("herdr-dev")).unwrap();
@@ -181,7 +201,7 @@ fn warm_connection_through_the_daemon_stops_running_ssh() {
     .unwrap();
     fs::write(
         remote_config.join("herdr-dev/config.toml"),
-        "onboarding = false\n",
+        format!("onboarding = false\n\n[remote]\nquic_port_range = \"{quic_port}-{quic_port}\"\n"),
     )
     .unwrap();
     fs::write(
@@ -226,13 +246,14 @@ fn warm_connection_through_the_daemon_stops_running_ssh() {
     fs::write(
         bin.join("ssh"),
         format!(
-            "#!/bin/sh\nsleep 0.025\nexport HOME={} XDG_CONFIG_HOME={} XDG_STATE_HOME={} XDG_RUNTIME_DIR={} HERDR_SOCKET_PATH={}\nunset HERDR_CLIENT_SOCKET_PATH HERDR_SESSION HERDR_ENV\ncontrol=; previous=; configuration=; last=\nfor arg do\n  if [ \"$previous\" = -S ]; then control=$arg; fi\n  if [ \"$arg\" = -G ]; then configuration=yes; fi\n  previous=$arg; last=$arg\ndone\nif [ -n \"$configuration\" ]; then printf 'controlpath %s\\n' \"$control\"; exit 0; fi\nprintf '%s\\n' \"$last\" >> {}\nexec /bin/sh -c \"$last\"\n",
+            "#!/bin/sh\nsleep 0.025\nexport HOME={} XDG_CONFIG_HOME={} XDG_STATE_HOME={} XDG_RUNTIME_DIR={} HERDR_SOCKET_PATH={}\nunset HERDR_CLIENT_SOCKET_PATH HERDR_SESSION HERDR_ENV\ncontrol=; previous=; configuration=; last=\nfor arg do\n  if [ \"$previous\" = -S ]; then control=$arg; fi\n  if [ \"$arg\" = -G ]; then configuration=yes; fi\n  previous=$arg; last=$arg\ndone\nif [ -n \"$configuration\" ]; then printf 'controlpath %s\\n' \"$control\"; printf 'hostname %s\\n' 127.0.0.1; printf 'port %s\\n' {port}; exit 0; fi\nprintf '%s\\n' \"$last\" >> {}\nexec /bin/sh -c \"$last\"\n",
             quote(&home),
             quote(&remote_config),
             quote(&remote_state),
             quote(&remote_runtime),
             quote(&remote_api),
             quote(&ssh_commands),
+            port = quic_port,
         ),
     )
     .unwrap();
@@ -245,15 +266,14 @@ fn warm_connection_through_the_daemon_stops_running_ssh() {
 
     let stable_socket = crate_persisted_path(&temp_dir);
     let _ = fs::remove_file(&stable_socket);
-    // Cold: no daemon yet; the client pays SSH discovery and bootstrap.
     let daemon_log = state_home.join("herdr-dev/herdr-remote-bridge-daemon.log");
+
+    // Cold: no daemon yet. The client spawns one, which discovers the remote
+    // host over SSH and bootstraps a credential.
     let (cold, _cold_master, mut cold_child) =
         timed_client_attach(&temp_dir, &path_env, &config_home, &state_home);
     wait_for_file(&stable_socket, &daemon_log, Duration::from_secs(15));
 
-    // Warm: the client attaches through the daemon. The freshly spawned
-    // daemon still owes its own one-time credential bootstrap, so allow it
-    // to settle before timing the steady state.
     let (warm, _warm_master, mut warm_child) =
         timed_client_attach(&temp_dir, &path_env, &config_home, &state_home);
     let settle = Instant::now() + Duration::from_secs(5);
@@ -268,18 +288,39 @@ fn warm_connection_through_the_daemon_stops_running_ssh() {
     let (third, _third_master, mut third_child) =
         timed_client_attach(&temp_dir, &path_env, &config_home, &state_home);
     let steady_calls = ssh_command_count(&ssh_commands);
+    let steady_log = fs::read_to_string(&daemon_log).unwrap_or_default();
 
-    // The SSH commands are what the daemon exists to remove, and they are the
-    // only part of the cold path a wall-clock comparison on a loaded runner
-    // cannot drown: the client's own startup dominates that number.
+    // The cold path really did have to reach the host.
     assert!(
         settled_calls > 0,
-        "the cold connection and the daemon's bootstrap must have run SSH commands"
+        "the cold connection and the daemon's bootstrap must have run SSH commands; daemon log:\n{steady_log}"
     );
+    // The whole point of the daemon: the steady-state attach adds nothing.
     assert_eq!(
         settled_calls, steady_calls,
-        "the steady-state connection must add no SSH commands"
+        "the steady-state connection must add no SSH commands; daemon log:\n{steady_log}"
     );
+    // And it is not merely skipping SSH -- the QUIC transport carried it.
+    // Every attach that reaches a live session logs this line.
+    assert_eq!(
+        steady_log
+            .lines()
+            .filter(|line| line.contains("remote QUIC transport connected"))
+            .count(),
+        1,
+        "the daemon must hold exactly one QUIC session across all three attaches; daemon log:\n{steady_log}"
+    );
+    // A single daemon serves all three attaches: no respawn, so PIDs are stable
+    // and the steady-state client reuses the socket the cold client created.
+    assert!(
+        stable_socket.exists(),
+        "the daemon's socket must survive for the steady-state attach"
+    );
+    assert!(
+        !steady_log.contains("persisted remote bridge idled out"),
+        "the daemon must not have idled out between attaches; daemon log:\n{steady_log}"
+    );
+
     eprintln!(
         "cold: {cold:?}, warm: {warm:?}, steady: {third:?}, ssh commands: {settled_calls}"
     );
