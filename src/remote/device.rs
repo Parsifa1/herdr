@@ -9,77 +9,106 @@ use std::path::{Path, PathBuf};
 use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const DEVICE_FILE: &str = "remote-quic-device.json";
-pub(crate) const DEVICES_FILE: &str = "remote-quic-devices.json";
+use super::private_file;
 
-/// The local device's key and its self-signed certificate. The certificate is
-/// stored rather than re-minted so its digest — which the server authorizes —
-/// stays stable across restarts.
-#[derive(Serialize, Deserialize)]
+pub(crate) const CLIENT_KEY_FILE: &str = "client.key";
+pub(crate) const DEVICES_FILE: &str = "devices";
+
+// 16-byte PKCS#8 v1 prefix plus a 32-byte Ed25519 seed.
+#[cfg(test)]
+const PKCS8_ED25519_PRIVATE_KEY_LEN: usize = 48;
+
+/// The local device's key and its self-signed certificate, in one PEM bundle:
+/// the key as PKCS#8 so `openssl pkey -in` reads it, the certificate beside it
+/// because its digest — which the server authorizes — must stay stable across
+/// restarts rather than being re-minted.
 pub(crate) struct DeviceIdentity {
-    private_key_hex: String,
-    certificate_hex: String,
+    private_key_der: Vec<u8>,
+    certificate_der: Vec<u8>,
 }
 
 impl DeviceIdentity {
     /// Reads an enrolled device, never creating one: checking whether this
     /// machine can renew a credential must not enroll it as a side effect.
     pub(crate) fn load(path: &Path) -> Option<Self> {
-        let bytes = std::fs::read(path).ok()?;
-        let stored: Self = serde_json::from_slice(&bytes).ok()?;
-        stored.private_key().ok()?;
-        Some(stored)
+        Self::try_load(path).ok().flatten()
     }
 
+    /// `Ok(None)` means no key has been written yet. A key file that exists but
+    /// does not parse is an error, never a reason to mint a new one: replacing
+    /// it would silently un-enroll the machine and abandon the certificate the
+    /// server still lists.
+    pub(crate) fn try_load(path: &Path) -> io::Result<Option<Self>> {
+        let Some(bytes) = private_file::read(path)? else {
+            return Ok(None);
+        };
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|err| invalid(format!("{} is not a PEM file: {err}", path.display())))?;
+        let (private_key_der, certificate_der) =
+            private_file::pem_read_key_and_certificate(text).map_err(|err| {
+                invalid(format!("{} is not a device key: {err}", path.display()))
+            })?;
+        Ok(Some(Self {
+            private_key_der,
+            certificate_der,
+        }))
+    }
+
+    /// Creates the device key unless one is already there, and returns whichever
+    /// key the machine now has. Creation is exclusive, so two processes starting
+    /// together agree on one identity instead of replacing each other's.
     pub(crate) fn load_or_create(path: &Path) -> io::Result<Self> {
-        if let Some(stored) = Self::load(path) {
-            return Ok(stored);
+        if let Some(identity) = Self::try_load(path)? {
+            return Ok(identity);
         }
         let identity = Self::create()?;
-        write_private(
-            path,
-            &serde_json::to_vec(&identity).map_err(io::Error::other)?,
-        )?;
-        Ok(identity)
+        let bundle = private_file::pem_encode(&[
+            ("PRIVATE KEY", &identity.private_key_der),
+            ("CERTIFICATE", &identity.certificate_der),
+        ]);
+        private_file::create_exclusive(path, bundle.as_bytes())?;
+        Self::try_load(path)?.ok_or_else(|| {
+            io::Error::other(format!(
+                "{} disappeared while it was being created",
+                path.display()
+            ))
+        })
     }
 
     fn create() -> io::Result<Self> {
-        let key = KeyPair::generate_for(&PKCS_ED25519)
-            .map_err(|err| io::Error::other(err.to_string()))?;
+        let key =
+            KeyPair::generate_for(&PKCS_ED25519).map_err(|err| io::Error::other(err.to_string()))?;
         let params = CertificateParams::new(vec!["herdr-device".to_owned()])
             .map_err(|err| io::Error::other(err.to_string()))?;
         let certificate = params
             .self_signed(&key)
             .map_err(|err| io::Error::other(err.to_string()))?;
         Ok(Self {
-            private_key_hex: hex_encode(&key.serialize_der()),
-            certificate_hex: hex_encode(certificate.der()),
+            private_key_der: key.serialize_der(),
+            certificate_der: certificate.der().to_vec(),
         })
     }
 
-    fn private_key(&self) -> io::Result<Vec<u8>> {
-        hex_decode(&self.private_key_hex)
-    }
-
     pub(crate) fn certificate_der(&self) -> Vec<u8> {
-        hex_decode(&self.certificate_hex).unwrap_or_default()
+        self.certificate_der.clone()
     }
 
     /// The TLS client configuration that presents this device.
     pub(crate) fn client_config(
         &self,
     ) -> Result<(Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>), String> {
-        let key = self.private_key().map_err(|err| err.to_string())?;
         Ok((
-            self.certificate_der(),
-            rustls::pki_types::PrivatePkcs8KeyDer::from(key).into(),
+            self.certificate_der.clone(),
+            rustls::pki_types::PrivatePkcs8KeyDer::from(self.private_key_der.clone()).into(),
         ))
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// The authorized devices, one compact JSON object per line: a line can be read
+/// and rewritten without parsing the rest, and a truncated line costs one entry
+/// rather than the whole list.
+#[derive(Debug, Default)]
 pub(crate) struct DeviceList {
-    #[serde(default)]
     pub(crate) devices: Vec<AuthorizedDevice>,
 }
 
@@ -96,13 +125,35 @@ pub(crate) struct AuthorizedDevice {
 }
 
 impl DeviceList {
-    /// A missing or unreadable file is an empty list: the first enrollment
-    /// creates it, and a corrupt file must not keep the endpoint down.
+    /// The authorization path. A corrupt file yields an empty list, so every
+    /// device is refused rather than trusted: a server that cannot read its
+    /// allowlist must not admit anyone.
     pub(crate) fn load(path: &Path) -> Self {
-        match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Self::default(),
+        Self::try_load(path).unwrap_or_else(|err| {
+            tracing::warn!(path = %path.display(), error = %err, "remote QUIC device list is not readable");
+            Self::default()
+        })
+    }
+
+    /// The mutation path: an unreadable line is an error, so a corrupt file is
+    /// never rewritten over. Filtering it to the lines that parse would quietly
+    /// drop every device the corruption touched.
+    pub(crate) fn try_load(path: &Path) -> io::Result<Self> {
+        let Some(bytes) = private_file::read(path)? else {
+            return Ok(Self::default());
+        };
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|err| invalid(format!("{} is not UTF-8: {err}", path.display())))?;
+        let mut devices = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            devices.push(serde_json::from_str(line).map_err(|err| {
+                invalid(format!("{}:{}: {err}", path.display(), index + 1))
+            })?);
         }
+        Ok(Self { devices })
     }
 
     pub(crate) fn contains(&self, certificate: &[u8]) -> bool {
@@ -133,8 +184,15 @@ impl DeviceList {
     }
 
     pub(crate) fn save(&self, path: &Path) -> io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
-        write_private(path, &bytes)
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut bytes = Vec::new();
+        for device in &self.devices {
+            bytes.extend_from_slice(&serde_json::to_vec(device).map_err(io::Error::other)?);
+            bytes.push(b'\n');
+        }
+        private_file::write_atomic(path, &bytes)
     }
 }
 
@@ -178,68 +236,52 @@ fn hex_decode(value: &str) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// 0600 in one step: the device key authorizes this machine, so it must never
-/// be world-readable, not even between create and chmod.
-pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&temporary, path)
+fn invalid(detail: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, detail)
 }
 
-pub(crate) fn device_path() -> PathBuf {
-    crate::config::state_dir().join(DEVICE_FILE)
+pub(crate) fn client_key_path() -> PathBuf {
+    crate::config::state_dir().join(CLIENT_KEY_FILE)
 }
 
 pub(crate) fn devices_path() -> PathBuf {
-    crate::config::config_dir().join(DEVICES_FILE)
+    crate::config::state_dir().join(DEVICES_FILE)
 }
 
-/// Records the certificate the SSH-authenticated bootstrap presented.
+/// Records the certificate the SSH-authenticated bootstrap presented. The
+/// read-modify-write holds the list's lock, so a concurrent revoke is not lost.
 pub(crate) fn enroll(certificate: &[u8], name: &str) -> io::Result<bool> {
-    let path = devices_path();
-    let mut devices = DeviceList::load(&path);
-    let added = devices.add(name, certificate, unix_seconds());
-    if added {
-        devices.save(&path)?;
-    }
-    Ok(added)
+    update_devices(|devices| devices.add(name, certificate, unix_seconds()))
 }
 
 /// Marks a device revoked and keeps its tombstone so the same certificate
 /// cannot be re-enrolled by a later SSH bootstrap.
 pub(crate) fn revoke(name: &str) -> io::Result<bool> {
-    let path = devices_path();
-    let mut devices = DeviceList::load(&path);
-    let mut revoked = false;
-    for device in &mut devices.devices {
-        if device.name == name && !device.revoked {
-            device.revoked = true;
-            revoked = true;
+    update_devices(|devices| {
+        let mut revoked = false;
+        for device in &mut devices.devices {
+            if device.name == name && !device.revoked {
+                device.revoked = true;
+                revoked = true;
+            }
         }
-    }
-    if revoked {
+        revoked
+    })
+}
+
+fn update_devices(change: impl FnOnce(&mut DeviceList) -> bool) -> io::Result<bool> {
+    let path = devices_path();
+    let _lock = private_file::lock(&path)?;
+    let mut devices = DeviceList::try_load(&path)?;
+    let changed = change(&mut devices);
+    if changed {
         devices.save(&path)?;
     }
-    Ok(revoked)
+    Ok(changed)
 }
 
 pub(crate) fn list() -> io::Result<DeviceList> {
-    Ok(DeviceList::load(&devices_path()))
+    DeviceList::try_load(&devices_path())
 }
 
 fn unix_seconds() -> u64 {
@@ -326,6 +368,14 @@ impl rustls::server::danger::ClientCertVerifier for DeviceCertVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("herdr-device-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     fn device_list() -> DeviceList {
         DeviceList::default()
@@ -355,12 +405,32 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_devices_file_reads_as_empty() {
-        let dir = std::env::temp_dir().join(format!("herdr-devices-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("devices.json");
-        std::fs::write(&path, b"not json").unwrap();
-        assert!(DeviceList::load(&path).devices.is_empty());
+    fn the_device_list_is_one_json_object_per_line() {
+        let dir = scratch("ndjson");
+        let path = dir.join("devices");
+        let mut devices = device_list();
+        devices.add("laptop", b"cert-a", 10);
+        devices.add("phone", b"cert-b", 20);
+        devices.save(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(text.starts_with("{\"name\":\"laptop\""), "{text}");
+        assert!(text.ends_with('\n'), "{text}");
+        let reloaded = DeviceList::try_load(&path).unwrap();
+        assert_eq!(reloaded.devices.len(), 2);
+        assert!(reloaded.contains(b"cert-a") && reloaded.contains(b"cert-b"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_devices_file_is_an_error_not_an_empty_list() {
+        let dir = scratch("corrupt");
+        let path = dir.join("devices");
+        std::fs::write(&path, b"{\"name\":\"a\"}\n{not json\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let err = DeviceList::try_load(&path).expect_err("a corrupt list must not read as empty");
+        assert!(err.to_string().contains(":2:"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -376,11 +446,8 @@ mod tests {
 
     #[test]
     fn a_device_key_is_created_once_and_reused() {
-        let dir = std::env::temp_dir().join(format!("herdr-devkey-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("device.json");
-
+        let dir = scratch("devkey");
+        let path = dir.join("device.key");
         let first = DeviceIdentity::load_or_create(&path).expect("create device key");
         let second = DeviceIdentity::load_or_create(&path).expect("reload device key");
         assert_eq!(first.certificate_der(), second.certificate_der());
@@ -389,14 +456,60 @@ mod tests {
     }
 
     #[test]
-    fn load_never_creates_a_device_key() {
-        let dir = std::env::temp_dir().join(format!("herdr-nodevkey-{}", std::process::id()));
+    fn the_device_key_is_a_pem_bundle_openssl_can_read() {
+        let dir = scratch("pem");
+        let path = dir.join("device.key");
+        let identity = DeviceIdentity::load_or_create(&path).expect("create device key");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("-----BEGIN PRIVATE KEY-----\n"), "{text}");
+        assert!(text.contains("-----BEGIN CERTIFICATE-----\n"), "{text}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let (key, _) = private_file::pem_read_key_and_certificate(&text).unwrap();
+        assert_eq!(key.len(), PKCS8_ED25519_PRIVATE_KEY_LEN);
+        assert!(!identity.certificate_der().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("missing.json");
+    }
 
+    #[test]
+    fn load_never_creates_a_device_key() {
+        let dir = scratch("nodevkey");
+        let path = dir.join("missing.key");
         assert!(DeviceIdentity::load(&path).is_none());
         assert!(!path.exists(), "a read must not enroll the machine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_device_key_is_never_replaced() {
+        let dir = scratch("badkey");
+        let path = dir.join("device.key");
+        std::fs::write(&path, b"-----BEGIN PRIVATE KEY-----\nnot base64!\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            DeviceIdentity::load_or_create(&path).is_err(),
+            "a broken key must surface, not be re-minted"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"-----BEGIN PRIVATE KEY-----\nnot base64!\n",
+            "the existing file was overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_device_key_others_can_read_is_refused() {
+        let dir = scratch("worldreadable");
+        let path = dir.join("device.key");
+        DeviceIdentity::load_or_create(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            DeviceIdentity::try_load(&path).is_err(),
+            "a world-readable device key is not trusted"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

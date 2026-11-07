@@ -7,6 +7,8 @@ pub(crate) mod device;
 #[cfg(unix)]
 pub(crate) mod frame;
 mod host;
+#[cfg(unix)]
+pub(crate) mod private_file;
 mod process;
 #[cfg(unix)]
 mod quic;

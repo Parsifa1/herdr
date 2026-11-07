@@ -135,7 +135,7 @@ impl RemoteQuicServer {
         let (sockets, port) = bind_sockets(start_port, end_port)?;
         let endpoints = make_endpoints(&server_config, &sockets)?;
 
-        let server_instance_id = load_or_create_server_instance_id()?;
+        let server_instance_id = identity.server_instance_id;
         let state = Arc::new(ServerState {
             server_instance_id,
             tokens: Mutex::new(HashMap::new()),
@@ -183,6 +183,7 @@ impl RemoteQuicServer {
             ));
         }
         let identity = ServerIdentity {
+            server_instance_id: state.server_instance_id,
             certificate_der: state.certificate_der,
             private_key_der: state.private_key_der,
             fingerprint: state.certificate_fingerprint,
@@ -468,6 +469,7 @@ struct ServerIdentity {
     certificate_der: Vec<u8>,
     private_key_der: Vec<u8>,
     fingerprint: [u8; REMOTE_QUIC_HASH_BYTES],
+    server_instance_id: [u8; REMOTE_QUIC_ID_BYTES],
 }
 
 impl ServerIdentity {
@@ -475,10 +477,12 @@ impl ServerIdentity {
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["herdr".to_owned()])?;
         let certificate_der = cert.der().to_vec();
+        let private_key_der = signing_key.serialize_der();
         Ok(Self {
             fingerprint: hash_bytes(&certificate_der),
+            server_instance_id: derive_instance_id(&certificate_der),
             certificate_der,
-            private_key_der: signing_key.serialize_der(),
+            private_key_der,
         })
     }
 
@@ -486,105 +490,56 @@ impl ServerIdentity {
     /// new one. Clients pin the certificate fingerprint, so a per-process
     /// identity would force an SSH bootstrap after every server restart.
     fn load_or_create() -> Result<Self, Box<dyn std::error::Error>> {
-        let path = crate::config::state_dir().join("remote-quic-identity.json");
-        if let Ok(bytes) = std::fs::read(&path) {
-            match serde_json::from_slice::<StoredIdentity>(&bytes) {
-                Ok(stored) => {
-                    return Ok(Self {
-                        fingerprint: hash_bytes(&stored.certificate_der),
-                        certificate_der: stored.certificate_der,
-                        private_key_der: stored.private_key_der,
-                    })
-                }
-                Err(err) => debug!(
-                    path = %path.display(),
-                    error = %err,
-                    "remote QUIC identity not parsed; minting a new one"
-                ),
-            }
+        let path = server_key_path();
+        if let Some(identity) = Self::read(&path)? {
+            return Ok(identity);
         }
         let identity = Self::generate()?;
-        identity.store(&path);
-        Ok(identity)
+        identity.store(&path)?;
+        Self::read(&path)?.ok_or_else(|| {
+            io::Error::other(format!("{} disappeared while it was created", path.display())).into()
+        })
     }
 
-    fn store(&self, path: &std::path::Path) {
-        let stored = StoredIdentity {
-            certificate_der: self.certificate_der.clone(),
-            private_key_der: self.private_key_der.clone(),
+    fn read(path: &std::path::Path) -> io::Result<Option<Self>> {
+        let Some(bytes) = crate::remote::private_file::read(path)? else {
+            return Ok(None);
         };
-        if let Err(err) = write_private_json(path, &stored) {
-            debug!(
-                path = %path.display(),
-                error = %err,
-                "remote QUIC identity not persisted; clients will rebootstrap after a restart"
-            );
-        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        let (private_key_der, certificate_der) =
+            crate::remote::private_file::pem_read_key_and_certificate(text)?;
+        Ok(Some(Self {
+            fingerprint: hash_bytes(&certificate_der),
+            server_instance_id: derive_instance_id(&certificate_der),
+            certificate_der,
+            private_key_der,
+        }))
+    }
+
+    fn store(&self, path: &std::path::Path) -> io::Result<()> {
+        let bundle = crate::remote::private_file::pem_encode(&[
+            ("PRIVATE KEY", &self.private_key_der),
+            ("CERTIFICATE", &self.certificate_der),
+        ]);
+        crate::remote::private_file::create_exclusive(path, bundle.as_bytes())?;
+        Ok(())
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct StoredIdentity {
-    certificate_der: Vec<u8>,
-    private_key_der: Vec<u8>,
+/// Derived from the certificate rather than stored: a client's cached credential
+/// and its pinned fingerprint then depend on exactly one persisted fact, so a
+/// fresh instance id can never invalidate a credential the certificate still
+/// authorizes.
+fn derive_instance_id(certificate_der: &[u8]) -> [u8; REMOTE_QUIC_ID_BYTES] {
+    let digest = hash_bytes(certificate_der);
+    let mut instance_id = [0u8; REMOTE_QUIC_ID_BYTES];
+    instance_id.copy_from_slice(&digest[..REMOTE_QUIC_ID_BYTES]);
+    instance_id
 }
 
-#[derive(Serialize, Deserialize)]
-struct StoredServerState {
-    server_instance_id: [u8; REMOTE_QUIC_ID_BYTES],
-}
-
-/// The private key and the instance id are the two things a client's cached
-/// credential and pinned fingerprint depend on, so both are private files
-/// replaced atomically.
-fn write_private_json<T: Serialize>(path: &std::path::Path, value: &T) -> io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&temporary, path)
-}
-
-fn generate_server_instance_id() -> io::Result<[u8; REMOTE_QUIC_ID_BYTES]> {
-    let mut server_instance_id = [0u8; REMOTE_QUIC_ID_BYTES];
-    getrandom::fill(&mut server_instance_id).map_err(|err| {
-        io::Error::other(format!("failed to generate QUIC server instance id: {err}"))
-    })?;
-    Ok(server_instance_id)
-}
-
-/// Same reasoning as the identity: a fresh instance id invalidates every
-/// capability a client already holds.
-fn load_or_create_server_instance_id() -> io::Result<[u8; REMOTE_QUIC_ID_BYTES]> {
-    let path = crate::config::state_dir().join("remote-quic-instance.json");
-    if let Ok(bytes) = std::fs::read(&path) {
-        if let Ok(stored) = serde_json::from_slice::<StoredServerState>(&bytes) {
-            return Ok(stored.server_instance_id);
-        }
-    }
-    let server_instance_id = generate_server_instance_id()?;
-    if let Err(err) = write_private_json(&path, &StoredServerState { server_instance_id }) {
-        debug!(
-            path = %path.display(),
-            error = %err,
-            "remote QUIC instance id not persisted; clients will rebootstrap after a restart"
-        );
-    }
-    Ok(server_instance_id)
+fn server_key_path() -> std::path::PathBuf {
+    crate::config::state_dir().join("server.key")
 }
 
 fn make_server_config(
@@ -2103,22 +2058,30 @@ mod tests {
     }
 
     #[test]
-    fn the_instance_id_survives_a_restart() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let _root = StateRoot::new("instance");
-
-        let first = load_or_create_server_instance_id().expect("mint instance id");
-        let second = load_or_create_server_instance_id().expect("reload instance id");
-        assert_eq!(first, second);
+    fn the_instance_id_is_derived_from_the_certificate() {
+        let certificate = vec![1u8, 2, 3, 4];
+        assert_eq!(derive_instance_id(&certificate), derive_instance_id(&certificate));
+        assert_ne!(
+            derive_instance_id(&certificate),
+            derive_instance_id(&[9u8, 9])
+        );
     }
 
     #[test]
-    fn an_unparseable_identity_file_mints_a_fresh_one() {
+    fn an_unparseable_server_key_is_an_error_rather_than_a_fresh_identity() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _root = StateRoot::new("identity-corrupt");
-        let path = crate::config::state_dir().join("remote-quic-identity.json");
+        let path = server_key_path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"not json").unwrap();
-        assert!(ServerIdentity::load_or_create().is_ok());
+        std::fs::write(&path, b"not a pem").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(
+            ServerIdentity::load_or_create().is_err(),
+            "re-minting would invalidate every pinned client without saying so"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a pem");
     }
 }
