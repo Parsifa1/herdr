@@ -1271,17 +1271,27 @@ fn remote_quic_bootstrap_command(
         format_logical_client_id(logical_client_id)
     );
     if let Some(certificate) = certificate {
-        // The helper runs on the server, so it cannot name this machine: the
-        // label travels with the certificate or devices would all be listed
-        // under the server's own hostname.
         command.push(' ');
         command.push_str(certificate);
-        command.push(' ');
-        command.push_str(&crate::remote::device::encode_hex(
-            crate::remote::device::local_label().as_bytes(),
-        ));
+        // The helper runs on the server, so it cannot name this machine. The
+        // label rides in an environment assignment rather than an argument:
+        // an older server rejects any argument list it does not recognise,
+        // which would cost the whole QUIC path instead of just the name.
+        command = format!(
+            "{} -- {}",
+            device_label_assignment(),
+            command
+        );
     }
     remote_session_command(remote_herdr, session, &command)
+}
+
+fn device_label_assignment() -> String {
+    use crate::remote::host::DEVICE_LABEL_ENV_VAR;
+    let label = crate::platform::hostname()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown-device".to_owned());
+    format!("{DEVICE_LABEL_ENV_VAR}={}", super::shell_quote(&label))
 }
 
 fn format_logical_client_id(value: &[u8; REMOTE_QUIC_ID_BYTES]) -> String {

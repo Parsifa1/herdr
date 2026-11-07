@@ -3,6 +3,10 @@
 use std::io;
 use std::time::Duration;
 
+/// Set by the client on the bootstrap command line.
+#[cfg(unix)]
+pub(crate) const DEVICE_LABEL_ENV_VAR: &str = "HERDR_QUIC_DEVICE_LABEL";
+
 pub(crate) fn run_remote_client_bridge(args: &[String]) -> io::Result<()> {
     let idle_timeout = match args {
         [] => false,
@@ -44,41 +48,25 @@ pub(crate) fn run_remote_client_bridge(args: &[String]) -> io::Result<()> {
 /// what lets it reconnect later without SSH.
 #[cfg(unix)]
 pub(crate) fn run_remote_quic_bootstrap(args: &[String]) -> io::Result<()> {
-    let (logical_client_id, certificate, label) = match args {
-        [id] => (id.as_str(), None, None),
+    let (logical_client_id, certificate) = match args {
+        [id] => (id.as_str(), None),
         [id, certificate] => (
             id.as_str(),
             Some(super::device::decode_hex(certificate).map_err(|err| {
                 io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
             })?),
-            None,
-        ),
-        [id, certificate, label] => (
-            id.as_str(),
-            Some(super::device::decode_hex(certificate).map_err(|err| {
-                io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
-            })?),
-            Some(
-                super::device::decode_hex(label)
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes).map_err(|err| {
-                            io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
-                        })
-                    })?,
-            ),
         ),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: remote-quic-bootstrap <client-id> [certificate-hex] [label-hex]",
+                "usage: remote-quic-bootstrap <client-id> [certificate-hex]",
             ))
         }
     };
     let logical_client_id = parse_logical_client_id(logical_client_id)?;
     ensure_remote_server_running()?;
     if let Some(certificate) = certificate {
-        let name = label.unwrap_or_else(device_label);
+        let name = device_label();
         match super::device::enroll(&certificate, &name) {
             Ok(true) => tracing::info!(device = %name, "remote QUIC device enrolled"),
             Ok(false) => {}
@@ -128,13 +116,19 @@ pub(crate) fn run_remote_quic_bootstrap(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-/// The enrolling machine's own name, so `herdr device list` is readable and
-/// `revoke` has something to type.
+/// The enrolling machine's name. The client supplies it in the environment
+/// because this helper runs on the server and cannot see the caller's hostname;
+/// falling back to our own keeps a bare invocation working.
 #[cfg(unix)]
 fn device_label() -> String {
-    crate::platform::hostname()
+    std::env::var(DEVICE_LABEL_ENV_VAR)
+        .ok()
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned())
+        .unwrap_or_else(|| {
+            crate::platform::hostname()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned())
+        })
 }
 
 #[cfg(unix)]
