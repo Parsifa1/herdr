@@ -990,10 +990,66 @@ type CredentialCache = HashMap<CredentialKey, CachedCredential>;
 struct StoredCredential {
     target: String,
     session: String,
-    record: RemoteBootstrapRecord,
+    record: StoredRecord,
     candidates: Vec<SocketAddr>,
     next_connection_generation: u64,
     proven: bool,
+}
+
+/// The credential as it is written to disk: every fixed-size field is base64
+/// rather than a list of decimal bytes, so one credential stays readable on a
+/// handful of lines. The wire form keeps its arrays; only this file changes.
+///
+/// `server_instance_id` is absent on purpose: the server derives it from the
+/// same certificate the fingerprint hashes, so it is that hash's first bytes
+/// and storing both would let the pair drift.
+#[derive(Serialize, Deserialize)]
+struct StoredRecord {
+    schema_version: u32,
+    port: u16,
+    certificate_fingerprint: String,
+    capability_token: String,
+    expires_unix_seconds: u64,
+}
+
+impl StoredRecord {
+    fn encode(record: &RemoteBootstrapRecord) -> Self {
+        Self {
+            schema_version: record.schema_version,
+            port: record.port,
+            certificate_fingerprint: base64_encode(&record.certificate_fingerprint),
+            capability_token: base64_encode(&record.capability_token),
+            expires_unix_seconds: record.expires_unix_seconds,
+        }
+    }
+
+    fn decode(&self) -> Option<RemoteBootstrapRecord> {
+        let certificate_fingerprint: [u8; crate::protocol::REMOTE_QUIC_HASH_BYTES] =
+            base64_decode(&self.certificate_fingerprint)?.try_into().ok()?;
+        let capability_token: [u8; crate::protocol::REMOTE_QUIC_TOKEN_BYTES] =
+            base64_decode(&self.capability_token)?.try_into().ok()?;
+        let mut server_instance_id = [0u8; crate::protocol::REMOTE_QUIC_ID_BYTES];
+        server_instance_id
+            .copy_from_slice(&certificate_fingerprint[..crate::protocol::REMOTE_QUIC_ID_BYTES]);
+        Some(RemoteBootstrapRecord {
+            schema_version: self.schema_version,
+            server_instance_id,
+            port: self.port,
+            certificate_fingerprint,
+            capability_token,
+            expires_unix_seconds: self.expires_unix_seconds,
+        })
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(text).ok()
 }
 
 /// `state_dir()` is resolved per call: tests point `XDG_STATE_HOME` at their
@@ -1026,16 +1082,24 @@ fn load_credential_cache() -> CredentialCache {
     };
     entries
         .into_iter()
-        .map(|entry| {
-            (
+        .filter_map(|entry| {
+            let Some(record) = entry.record.decode() else {
+                debug!(
+                    target = %entry.target,
+                    session = %entry.session,
+                    "remote QUIC hosts entry is not readable; the next dial bootstraps"
+                );
+                return None;
+            };
+            Some((
                 (entry.target, entry.session),
                 CachedCredential {
-                    record: entry.record,
+                    record,
                     candidates: entry.candidates,
                     next_connection_generation: entry.next_connection_generation,
                     proven: entry.proven,
                 },
-            )
+            ))
         })
         .collect()
 }
@@ -1050,7 +1114,7 @@ fn save_credential_cache(cache: &CredentialCache) -> io::Result<()> {
         .map(|((target, session), entry)| StoredCredential {
             target: target.clone(),
             session: session.clone(),
-            record: entry.record.clone(),
+            record: StoredRecord::encode(&entry.record),
             candidates: entry.candidates.clone(),
             next_connection_generation: entry.next_connection_generation,
             proven: entry.proven,
@@ -1420,11 +1484,17 @@ mod tests {
     use crate::protocol::{read_message, REMOTE_QUIC_HASH_BYTES, REMOTE_QUIC_TOKEN_BYTES};
 
     fn record(expires_unix_seconds: u64) -> RemoteBootstrapRecord {
+        // The server derives both from one certificate hash, so the fixture
+        // must too: a fingerprint and an instance id that disagree would pass
+        // here and fail against a real server.
+        let certificate_fingerprint = [9; REMOTE_QUIC_HASH_BYTES];
+        let mut server_instance_id = [0u8; REMOTE_QUIC_ID_BYTES];
+        server_instance_id.copy_from_slice(&certificate_fingerprint[..REMOTE_QUIC_ID_BYTES]);
         RemoteBootstrapRecord {
             schema_version: REMOTE_QUIC_SCHEMA_VERSION,
-            server_instance_id: [7; REMOTE_QUIC_ID_BYTES],
+            server_instance_id,
             port: 48_001,
-            certificate_fingerprint: [9; REMOTE_QUIC_HASH_BYTES],
+            certificate_fingerprint,
             capability_token: [3; REMOTE_QUIC_TOKEN_BYTES],
             expires_unix_seconds,
         }
@@ -1551,6 +1621,47 @@ mod tests {
         assert!(text.starts_with("[\n  {\n    \"target\": \"fedora\","), "{text}");
         assert!(text.ends_with("}\n]\n"), "{text}");
         assert_eq!(load_credential_cache().len(), 2);
+    }
+
+    #[test]
+    fn a_credential_is_written_as_base64_over_a_handful_of_lines() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _dir = StateDir::new("base64");
+        store_credential(key(), record(9_999), Vec::new());
+
+        let text = std::fs::read_to_string(hosts_path()).unwrap();
+        assert!(
+            text.contains(&format!(
+                "\"certificate_fingerprint\": \"{}\"",
+                base64_encode(&record(9_999).certificate_fingerprint)
+            )),
+            "a fingerprint is one base64 string, not a list of decimal bytes:\n{text}"
+        );
+        assert!(
+            !text.contains("\"server_instance_id\""),
+            "the instance id is derived from the fingerprint, never stored twice:\n{text}"
+        );
+        assert!(
+            text.lines().count() < 30,
+            "one credential must stay short:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_stored_credential_decodes_back_to_the_record_it_was_written_from() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _dir = StateDir::new("roundtrip-record");
+        let original = record(9_999);
+        let encoded = StoredRecord::encode(&original);
+        let decoded = encoded.decode().expect("decodes");
+        assert_eq!(decoded, original, "base64 must preserve every field");
+
+        // The instance id is reconstructed from the fingerprint, so a server
+        // whose certificate the fingerprint pins always matches.
+        assert_eq!(
+            decoded.server_instance_id,
+            original.certificate_fingerprint[..crate::protocol::REMOTE_QUIC_ID_BYTES]
+        );
     }
 
     #[test]
