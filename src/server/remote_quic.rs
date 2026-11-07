@@ -2055,6 +2055,28 @@ mod tests {
         assert_eq!(first.fingerprint, second.fingerprint);
         assert_eq!(first.certificate_der, second.certificate_der);
         assert_eq!(first.private_key_der, second.private_key_der);
+        assert_eq!(
+            first.server_instance_id,
+            derive_instance_id(&first.certificate_der),
+            "the instance id follows the certificate, not a second file"
+        );
+    }
+
+    #[test]
+    fn the_server_key_is_a_pem_bundle_openssl_can_read() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _root = StateRoot::new("identity-pem");
+        ServerIdentity::load_or_create().expect("mint identity");
+
+        let path = server_key_path();
+        assert_eq!(path.file_name().unwrap(), "server.key");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("-----BEGIN PRIVATE KEY-----\n"), "{text}");
+        assert!(text.contains("-----BEGIN CERTIFICATE-----\n"), "{text}");
+        let (key, certificate) =
+            crate::remote::private_file::pem_read_key_and_certificate(&text).unwrap();
+        assert!(!key.is_empty(), "the bundle carries a private key");
+        assert!(!certificate.is_empty(), "the bundle carries its certificate");
     }
 
     #[test]

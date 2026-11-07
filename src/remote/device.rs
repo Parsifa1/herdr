@@ -435,6 +435,43 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_enrollments_keep_every_device() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let root = scratch("enroll-race");
+        let config = root.join("config");
+        let state = root.join("state");
+        let previous = (
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("XDG_STATE_HOME"),
+        );
+        std::env::set_var("XDG_CONFIG_HOME", &config);
+        std::env::set_var("XDG_STATE_HOME", &state);
+
+        // Enrollment runs from an SSH bootstrap, so two hosts enrolling at
+        // once must not lose each other's row.
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                scope.spawn(move || {
+                    enroll(format!("cert-{index}").as_bytes(), &format!("machine-{index}"))
+                        .expect("enroll");
+                });
+            }
+        });
+        let devices = list().expect("read devices");
+        assert_eq!(devices.devices.len(), 8, "{:?}", devices.devices);
+
+        match previous.0 {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match previous.1 {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn hex_round_trips() {
         assert_eq!(
             decode_hex(&encode_hex(b"\x00\xff\x10")).unwrap(),

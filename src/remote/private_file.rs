@@ -19,6 +19,9 @@ use base64::Engine as _;
 /// A secret others can read is compromised, so every caller of [`read`] gets
 /// this check for free rather than having to remember it.
 pub(crate) fn check_private(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        check_private_dir(parent)?;
+    }
     // symlink_metadata, not metadata: a symlink to a private file is still a
     // path somebody else chose.
     let metadata = match std::fs::symlink_metadata(path) {
@@ -49,6 +52,33 @@ pub(crate) fn check_private(path: &Path) -> io::Result<()> {
             io::ErrorKind::PermissionDenied,
             format!(
                 "{} is accessible by others (mode {mode:04o}); chmod 600 it",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A world-writable directory can rename or replace the file inside it, so a
+/// 0600 file is only private if the directory holding it is private too.
+fn check_private_dir(path: &Path) -> io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+        Ok(metadata) => metadata,
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a symlink, not a directory", path.display()),
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is writable by others (mode {mode:04o}); chmod go-w it",
                 path.display()
             ),
         ));
@@ -288,6 +318,56 @@ mod tests {
         write_atomic(&real, b"x").unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(read(&link).is_err(), "a symlink can point anywhere");
+    }
+
+    #[test]
+    fn a_directory_others_can_write_is_refused() {
+        let scratch = Scratch::new("shared-dir");
+        let dir = scratch.join("nested");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret");
+        write_atomic(&path, b"x").unwrap();
+        for mode in [0o777, 0o757, 0o775] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = read(&path).expect_err("a replaceable file is not private");
+            assert!(err.to_string().contains("chmod go-w"), "{mode:04o}: {err}");
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(read(&path).unwrap().as_deref(), Some(&b"x"[..]));
+    }
+
+    #[test]
+    fn concurrent_writers_keep_every_entry() {
+        let scratch = Scratch::new("concurrent");
+        let path = scratch.join("table");
+        // Each writer does exactly what a bridge daemon does: lock, re-read,
+        // append its own row, write. A snapshot kept outside the lock would
+        // lose rows here.
+        let writers = 8;
+        let appends = 5;
+        std::thread::scope(|scope| {
+            for writer in 0..writers {
+                let path = path.clone();
+                scope.spawn(move || {
+                    for append in 0..appends {
+                        let _lock = lock(&path).unwrap();
+                        let mut rows = read(&path)
+                            .unwrap()
+                            .map(|bytes| String::from_utf8(bytes).unwrap())
+                            .unwrap_or_default();
+                        rows.push_str(&format!("{writer}-{append}\n"));
+                        write_atomic(&path, rows.as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        let rows = read(&path).unwrap().unwrap();
+        let rows = String::from_utf8(rows).unwrap();
+        assert_eq!(
+            rows.lines().count(),
+            writers * appends,
+            "a lost update means the lock was released too early:\n{rows}"
+        );
     }
 
     #[test]
