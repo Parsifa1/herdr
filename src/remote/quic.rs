@@ -495,9 +495,11 @@ impl QuicSession {
     pub(crate) fn rebind(&self) -> Result<(), String> {
         rebind_endpoint(&self.endpoint, self.remote_ip)
     }
-    /// Resolves when the connection ends, classifying what the bridge may do.
-    pub(crate) async fn closed(&self) -> SessionExit {
-        classify_close(&self.connection.closed().await)
+    /// How this connection ended, if it has. Synchronous so a pump that has
+    /// just lost its stream can say why without awaiting a close that already
+    /// happened.
+    pub(crate) fn close_exit(&self) -> Option<SessionExit> {
+        self.connection.close_reason().map(|error| classify_close(&error))
     }
 
     /// Closes the connection with an application code, and the endpoint with

@@ -668,7 +668,15 @@ async fn run_control_pump(
                             }
                         }
                     }
-                    _ => return,
+                    _ => {
+                        // The stream ended. The connection may still be open,
+                        // so this reports only what is already known.
+                        match session.close_exit() {
+                            Some(exit) => info!(exit = %exit, "remote QUIC session ended"),
+                            None => debug!("remote QUIC control stream closed with the session open"),
+                        }
+                        return;
+                    }
                 }
             }
             () = tokio::time::sleep_until(deadline) => {
