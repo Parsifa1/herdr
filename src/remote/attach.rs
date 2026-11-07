@@ -554,6 +554,31 @@ impl RemoteHerdr {
         self
     }
 
+    /// Rebuild the command builder from cached SSH metadata instead of probing
+    /// the host. Only `os` and the resolved executable are needed to *drive* a
+    /// remote Herdr; the architecture is used solely to pick a download asset,
+    /// so it stays unknown here rather than costing a round trip.
+    pub(super) fn from_metadata(
+        metadata: &crate::client::endpoint::SshMachineMetadata,
+    ) -> Self {
+        let platform = RemotePlatform {
+            os: if metadata.os == "windows" {
+                "windows"
+            } else if metadata.os == "macos" {
+                "macos"
+            } else {
+                "linux"
+            },
+            arch: "unknown",
+        };
+        let remote = Self::for_platform(platform);
+        if remote.platform.is_windows() {
+            remote.with_windows_path(metadata.executable.clone())
+        } else {
+            remote.with_posix_path(&metadata.executable)
+        }
+    }
+
     /// A remote Herdr at an explicit path on a Linux x86_64 host, for live
     /// loopback tests that must not touch the installed binary.
     #[cfg(all(test, unix))]
@@ -5027,6 +5052,32 @@ mod tests {
                 .unwrap()
                 .executable,
             path
+        );
+    }
+
+    #[test]
+    fn cached_metadata_rebuilds_the_bridge_command_without_a_probe() {
+        let metadata = crate::client::endpoint::SshMachineMetadata {
+            os: "linux".into(),
+            executable: "/home/user/herdr".into(),
+        };
+        let remote = RemoteHerdr::from_metadata(&metadata);
+        assert_eq!(
+            remote.bridge_command(crate::session::DEFAULT_SESSION_NAME),
+            "printf '\\n%s\\n' 'herdr-remote-output-ready:1'\nexec /home/user/herdr remote-client-bridge"
+        );
+        assert_eq!(
+            remote.machine_metadata().expect("resolved path").executable,
+            "/home/user/herdr"
+        );
+
+        let windows = RemoteHerdr::from_metadata(&crate::client::endpoint::SshMachineMetadata {
+            os: "windows".into(),
+            executable: r"C:\herdr\herdr.exe".into(),
+        });
+        assert_eq!(
+            windows.machine_metadata().expect("resolved path").executable,
+            r"C:\herdr\herdr.exe"
         );
     }
 

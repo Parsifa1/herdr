@@ -579,6 +579,7 @@ fn acquire_shared_session(
                             target = %config.target,
                             generation = dial.generation,
                             elapsed_ms = dial_started.elapsed().as_millis() as u64,
+                            since_start_ms = process_uptime_ms(),
                             "remote QUIC transport connected"
                         );
                         mark_credential_proven(key);
@@ -1253,6 +1254,13 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Milliseconds since this process started, so a cold-start log line says how
+/// much of the delay belongs to the bridge rather than to the dial.
+fn process_uptime_ms() -> u64 {
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    START.elapsed().as_millis() as u64
+}
+
 // ---------------------------------------------------------------------------
 // SSH bootstrap
 // ---------------------------------------------------------------------------
@@ -1502,6 +1510,16 @@ mod tests {
         assert!(
             !command.contains(crate::remote::host::DEVICE_LABEL_ENV_VAR),
             "a plain credential request needs no label: {command}"
+        );
+    }
+
+    #[test]
+    fn the_uptime_baseline_starts_once_and_only_grows() {
+        let first = process_uptime_ms();
+        let second = process_uptime_ms();
+        assert!(
+            second >= first,
+            "the baseline is a single process-wide instant, never re-read: {first} then {second}"
         );
     }
 

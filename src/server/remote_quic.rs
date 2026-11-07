@@ -1011,9 +1011,15 @@ fn validate_and_fence(
         Err(error) => {
             // An expired capability from an authenticated device is renewed
             // instead: the device key is the durable identity, so asking the
-            // user's SSH session again would defeat the enrollment. Any other
-            // failure is a real mismatch and stays fatal.
-            let renewed = matches!(error, CapabilityValidationError::Expired)
+            // user's SSH session again would defeat the enrollment. A token
+            // this process never saw is the same situation after a restart --
+            // the table is memory-only. Any other failure is a real mismatch
+            // and stays fatal.
+            let renewable = matches!(
+                error,
+                CapabilityValidationError::Expired | CapabilityValidationError::UnknownOrRevoked
+            );
+            let renewed = renewable
                 .then(|| renew_device_capability(state, connection, hello, &mut *tokens, now))
                 .flatten();
             match renewed {
@@ -1044,9 +1050,17 @@ fn validate_and_fence(
     })
 }
 
-/// Re-issues a capability for a device that authenticated with TLS, but only
-/// when every scope check except expiry already passes: an expired token must
-/// not be a skeleton key for a different session or a different device.
+/// Re-issues a capability for a device that authenticated with TLS. Every
+/// scope check that the stored capability can answer still runs; what changes
+/// is that a missing entry no longer ends the story.
+///
+/// The token table lives only in memory, so it dies with the server process.
+/// Without this, an enrolled device would have to run a fresh SSH bootstrap
+/// after every server restart, which is exactly the cost enrollment exists to
+/// remove. The device certificate is the durable identity here, and it was
+/// already checked against the authorized list, so a rebuilt entry grants no
+/// more than the enrollment did. Session and generation fencing still apply:
+/// the session comes from this server, never from the hello.
 fn renew_device_capability(
     state: &ServerState,
     connection: &Connection,
@@ -1061,17 +1075,46 @@ fn renew_device_capability(
         return None;
     }
     let token_hash = hash_bytes(&hello.capability_token);
-    let capability = tokens.get_mut(&token_hash)?;
-    if capability.logical_client_id != hello.logical_client_id
-        || capability.session != state.active_session
-        || hello.connection_generation <= capability.connection_generation
-    {
-        return None;
+    let expires_unix_seconds = now.saturating_add(state.token_lifetime.as_secs());
+    match tokens.get_mut(&token_hash) {
+        Some(capability) => {
+            if capability.logical_client_id != hello.logical_client_id
+                || capability.session != state.active_session
+                || hello.connection_generation <= capability.connection_generation
+            {
+                return None;
+            }
+            capability.expires_unix_seconds = expires_unix_seconds;
+        }
+        None => {
+            // Generation 0 is what bootstrap mints; a caller that never held a
+            // capability has nothing to fence against.
+            if hello.connection_generation == 0 {
+                return None;
+            }
+            if tokens.len() >= MAX_TOKENS {
+                let oldest = tokens
+                    .iter()
+                    .min_by_key(|(_, capability)| capability.issued_order)
+                    .map(|(hash, _)| *hash)?;
+                tokens.remove(&oldest);
+            }
+            let issued_order = state.token_order.fetch_add(1, Ordering::Relaxed);
+            tokens.insert(
+                token_hash,
+                Capability {
+                    session: state.active_session.clone(),
+                    logical_client_id: hello.logical_client_id,
+                    expires_unix_seconds,
+                    connection_generation: 0,
+                    active_connection: None,
+                    issued_order,
+                },
+            );
+        }
     }
-    capability.expires_unix_seconds = now.saturating_add(state.token_lifetime.as_secs());
-    let session = capability.session.clone();
     info!(
-        session = %session,
+        session = %state.active_session,
         "remote QUIC capability renewed for an enrolled device"
     );
     Some(token_hash)
@@ -1192,6 +1235,57 @@ mod tests {
                 .is_some_and(|capability| capability.expires_unix_seconds > unix_seconds()),
             "the stored capability was extended"
         );
+        drop(client);
+    }
+
+    /// The token table is memory-only, so a server restart leaves an enrolled
+    /// device holding a token this process has never seen. It must still be
+    /// accepted: the certificate is the durable identity, and demanding SSH
+    /// again would make enrollment meaningless.
+    #[tokio::test]
+    async fn an_enrolled_device_survives_a_server_restart() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _root = StateRoot::new("restart");
+        let TestServer { server, .. } = test_server_on_free_port();
+        let record = mint(&server, 33);
+        let identity = enroll_test_device("laptop");
+
+        // Stand in for a restart: the same identity survives, the table does not.
+        lock(&server.state.tokens).clear();
+
+        let mut client = dial_with_hello_and_device(&record, 33, 1, Some(&identity)).await;
+        let accepted: RemoteQuicAccepted = read_async_message(&mut client.recv, MAX_HELLO_SIZE)
+            .await
+            .expect("an enrolled device reconnects after the token table dies");
+        assert_eq!(accepted.connection_generation, 1);
+        assert!(
+            lock(&server.state.tokens)
+                .contains_key(&hash_bytes(&record.capability_token)),
+            "the rebuilt capability is stored for the next reconnect"
+        );
+        drop(client);
+    }
+
+    /// A device with no valid token and no generation has nothing to fence
+    /// against, so rebuilding an entry for it would mint authority from
+    /// nothing.
+    #[tokio::test]
+    async fn an_unknown_capability_without_a_generation_is_refused() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _root = StateRoot::new("restart-gen0");
+        let TestServer { server, .. } = test_server_on_free_port();
+        let record = mint(&server, 34);
+        let identity = enroll_test_device("phone");
+        lock(&server.state.tokens).clear();
+
+        let mut client = dial_with_hello_and_device(&record, 34, 0, Some(&identity)).await;
+        let refusal = read_async_message::<RemoteQuicAccepted>(&mut client.recv, MAX_HELLO_SIZE)
+            .await;
+        assert!(
+            refusal.is_err(),
+            "generation 0 with no stored capability must not be renewed"
+        );
+        assert!(lock(&server.state.tokens).is_empty(), "nothing was minted");
         drop(client);
     }
 

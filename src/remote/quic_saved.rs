@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::attach::find_installed_remote_herdr;
+use super::attach::{find_installed_remote_herdr, RemoteHerdr};
 use super::quic_bridge::{QuicBridge, QuicBridgeConfig};
 use super::saved::validated_saved_ssh;
 
@@ -133,7 +133,15 @@ pub(crate) fn run_remote_bridge_daemon(args: &[String]) -> io::Result<()> {
     crate::logging::init_file_logging("herdr-remote-bridge-daemon.log");
 
     let ssh = validated_saved_ssh(profile_id, target, session)?;
-    let remote_herdr = find_installed_remote_herdr(&ssh)?;
+    // Probing the remote host costs two SSH round trips, and driving a remote
+    // Herdr needs only the OS and the resolved executable -- both of which the
+    // setup path already cached. A cache miss falls back to discovery.
+    let metadata_cache =
+        crate::client::endpoint::SshMetadataCache::new(profile_id, target, session)?;
+    let remote_herdr = match metadata_cache.load() {
+        Some(metadata) => RemoteHerdr::from_metadata(&metadata),
+        None => find_installed_remote_herdr(&ssh)?,
+    };
     let path = persisted_bridge_path(profile_id, target, session);
 
     let bridge = QuicBridge::start(
