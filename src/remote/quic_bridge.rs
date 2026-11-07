@@ -2200,7 +2200,14 @@ mod tests {
     fn a_credential_hit_never_reaches_ssh() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("no-ssh");
-        store_credential(key(), record(9_999), Vec::new(), [0x11; REMOTE_QUIC_ID_BYTES]);
+        // Far enough ahead that the expiry branch cannot answer: this test is
+        // about the cache lookup, not about lifetime.
+        store_credential(
+            key(),
+            record(u64::MAX),
+            Vec::new(),
+            [0x11; REMOTE_QUIC_ID_BYTES],
+        );
 
         // No server is running and no SSH target exists, so any attempt to
         // bootstrap would fail rather than silently succeed. Reaching the
