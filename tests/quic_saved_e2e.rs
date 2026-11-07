@@ -30,16 +30,21 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 mod support;
 
-const PROFILE: &str = "0123456789abcdef0123456789abcdef";
-const TARGET: &str = "fakehost";
-const RENDERED_OUTPUT_BYTES: usize = 2000;
+/// A fresh profile id per fixture. Two tests running in parallel must not
+/// share one: the ids appear in the daemon's command line, and terminating a
+/// daemon by matching that line would otherwise kill the other test's.
+fn unique_profile(nonce: u128) -> String {
+    format!("{nonce:032x}")
+}
 
 fn unique_dir(_prefix: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch")
         .as_nanos();
-    PathBuf::from("/tmp").join(format!("hqt-{nonce:x}"))
+    // Two tests in one process can read the clock within the same nanosecond,
+    // and create_dir_all is not an exclusive claim on the path.
+    PathBuf::from("/tmp").join(format!("hqt-{}-{nonce:x}", std::process::id()))
 }
 
 fn wait_for_file(path: &Path, log: &Path, timeout: Duration) {
@@ -66,9 +71,9 @@ fn persisted_socket_hash(profile_id: &str, target: &str, session: &str) -> Strin
     format!("{:016x}", hasher.finish())
 }
 
-fn crate_persisted_path(temp_dir: &Path) -> PathBuf {
-    let hash = persisted_socket_hash(PROFILE, TARGET, "default");
-    temp_dir.join(format!("herdr-qp-{PROFILE}-{hash}.sock"))
+fn crate_persisted_path(temp_dir: &Path, profile: &str, target: &str) -> PathBuf {
+    let hash = persisted_socket_hash(profile, target, "default");
+    temp_dir.join(format!("herdr-qp-{profile}-{hash}.sock"))
 }
 
 /// How many SSH commands the fake ssh has been asked to run so far.
@@ -173,6 +178,8 @@ fn timed_client_attach(
 /// One fake remote host: a real herdr server on a UDP port the fake ssh
 /// reports as the endpoint's address, plus a fake ssh that logs every command.
 struct Fixture {
+    profile: String,
+    target: String,
     temp_dir: PathBuf,
     config_home: PathBuf,
     state_home: PathBuf,
@@ -187,6 +194,13 @@ impl Fixture {
         fs::create_dir_all(&base).expect("create base");
         let temp_dir = base.join("tmp");
         fs::create_dir_all(&temp_dir).unwrap();
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let profile = unique_profile(nonce);
+        let target = format!("fakehost-{nonce:x}");
 
         let config_home = base.join("config");
         let state_home = base.join("state");
@@ -217,8 +231,8 @@ impl Fixture {
         fs::write(
             state_home.join("herdr-dev").join("client").join("endpoints.json"),
             serde_json::json!({
-                "version": 1, "selected_profile": PROFILE,
-                "ssh": [{"id": PROFILE, "label": "Timing machine", "target": TARGET, "session": "default", "enabled": true}],
+                "version": 1, "selected_profile": profile,
+                "ssh": [{"id": profile, "label": "Timing machine", "target": target, "session": "default", "enabled": true}],
             })
             .to_string(),
         )
@@ -279,6 +293,8 @@ impl Fixture {
         );
 
         Self {
+            profile,
+            target,
             temp_dir,
             config_home,
             state_home,
@@ -294,7 +310,7 @@ impl Fixture {
     }
 
     fn stable_socket(&self) -> PathBuf {
-        crate_persisted_path(&self.temp_dir)
+        crate_persisted_path(&self.temp_dir, &self.profile, &self.target)
     }
 
     fn ssh_calls(&self) -> usize {
@@ -418,7 +434,7 @@ fn a_registered_device_cold_starts_without_touching_ssh() {
     // The daemon detaches, so it is not one of our children; match it by the
     // profile id it carries on its command line.
     let _ = Command::new("pkill")
-        .args(["-f", &format!("remote-bridge-daemon {PROFILE}")])
+        .args(["-f", &format!("remote-bridge-daemon {}", fixture.profile)])
         .status();
     // Wait for the daemon's socket to disappear, which is how its exit is
     // observable from here.
