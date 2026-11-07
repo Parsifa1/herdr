@@ -1749,7 +1749,7 @@ mod tests {
         store(key(), record(9_999), Vec::new());
         mark_credential_proven(&key());
         // A second daemon writing its own row must not reset the first's flag.
-        store_credential(other.clone(), record(9_999), Vec::new());
+        store(other.clone(), record(9_999), Vec::new());
 
         let cache = load_credential_cache();
         assert!(cache.get(&key()).expect("first entry").proven);
