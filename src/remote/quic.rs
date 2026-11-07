@@ -499,7 +499,9 @@ impl QuicSession {
     /// just lost its stream can say why without awaiting a close that already
     /// happened.
     pub(crate) fn close_exit(&self) -> Option<SessionExit> {
-        self.connection.close_reason().map(|error| classify_close(&error))
+        self.connection
+            .close_reason()
+            .map(|error| classify_close(&error))
     }
 
     /// Closes the connection with an application code, and the endpoint with
@@ -883,8 +885,7 @@ fn client_config(fingerprint: [u8; REMOTE_QUIC_HASH_BYTES]) -> Result<quinn::Cli
 
 /// The enrolled device's credentials, or nothing when this machine has not
 /// enrolled: the capability token still authorizes that connection.
-fn device_client_credentials(
-) -> Option<(Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>)> {
+fn device_client_credentials() -> Option<(Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>)> {
     let path = crate::remote::device::device_path();
     let identity = crate::remote::device::DeviceIdentity::load(&path)?;
     identity.client_config().ok()

@@ -281,7 +281,11 @@ fn session_command() -> Command {
 fn device_command() -> Command {
     Command::new("device")
         .about("Manage devices enrolled for remote QUIC access")
-        .subcommand(Command::new("list").about("List enrolled devices").arg(json_flag()))
+        .subcommand(
+            Command::new("list")
+                .about("List enrolled devices")
+                .arg(json_flag()),
+        )
         .subcommand(
             Command::new("revoke")
                 .about("Revoke an enrolled device")

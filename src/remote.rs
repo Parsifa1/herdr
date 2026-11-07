@@ -3,9 +3,9 @@ mod attach;
 #[cfg(all(test, unix))]
 mod benchmark;
 #[cfg(unix)]
-pub(crate) mod frame;
-#[cfg(unix)]
 pub(crate) mod device;
+#[cfg(unix)]
+pub(crate) mod frame;
 mod host;
 mod process;
 #[cfg(unix)]

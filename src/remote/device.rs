@@ -36,7 +36,10 @@ impl DeviceIdentity {
             return Ok(stored);
         }
         let identity = Self::create()?;
-        write_private(path, &serde_json::to_vec(&identity).map_err(io::Error::other)?)?;
+        write_private(
+            path,
+            &serde_json::to_vec(&identity).map_err(io::Error::other)?,
+        )?;
         Ok(identity)
     }
 
@@ -111,9 +114,9 @@ impl DeviceList {
 
     fn is_revoked(&self, certificate: &[u8]) -> bool {
         let digest = hex_encode(&hash(certificate));
-        self.devices.iter().any(|device| {
-            device.revoked && device.certificate_sha256.eq_ignore_ascii_case(&digest)
-        })
+        self.devices
+            .iter()
+            .any(|device| device.revoked && device.certificate_sha256.eq_ignore_ascii_case(&digest))
     }
 
     pub(crate) fn add(&mut self, name: &str, certificate: &[u8], now_unix_seconds: u64) -> bool {
@@ -344,7 +347,10 @@ mod tests {
         devices.add("laptop", b"cert-a", 10);
         devices.devices[0].revoked = true;
         assert!(!devices.contains(b"cert-a"));
-        assert!(!devices.add("laptop", b"cert-a", 20), "a revoked key must not re-enroll");
+        assert!(
+            !devices.add("laptop", b"cert-a", 20),
+            "a revoked key must not re-enroll"
+        );
         assert_eq!(devices.devices.len(), 1);
     }
 
@@ -360,7 +366,10 @@ mod tests {
 
     #[test]
     fn hex_round_trips() {
-        assert_eq!(decode_hex(&encode_hex(b"\x00\xff\x10")).unwrap(), b"\x00\xff\x10");
+        assert_eq!(
+            decode_hex(&encode_hex(b"\x00\xff\x10")).unwrap(),
+            b"\x00\xff\x10"
+        );
         assert!(decode_hex("abc").is_err());
         assert!(decode_hex("zz").is_err());
     }

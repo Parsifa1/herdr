@@ -1001,10 +1001,7 @@ fn validate_and_fence(
             .contains(&certificate)
         {
             let detail = "remote device certificate is not authorized";
-            connection.close(
-                VarInt::from_u32(REMOTE_QUIC_CLOSE_AUTH),
-                detail.as_bytes(),
-            );
+            connection.close(VarInt::from_u32(REMOTE_QUIC_CLOSE_AUTH), detail.as_bytes());
             return Err(detail.to_owned());
         }
     }
@@ -1185,8 +1182,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("herdr-mtls-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let identity = crate::remote::device::DeviceIdentity::load_or_create(&dir.join("device.json"))
-            .expect("create device identity");
+        let identity =
+            crate::remote::device::DeviceIdentity::load_or_create(&dir.join("device.json"))
+                .expect("create device identity");
         crate::remote::device::enroll(&identity.certificate_der(), name).expect("enroll device");
         let _ = std::fs::remove_dir_all(&dir);
         identity
@@ -1201,21 +1199,27 @@ mod tests {
 
         let identity = enroll_test_device("laptop");
         let mut client = dial_with_hello_and_device(&record, 31, 1, Some(&identity)).await;
-        let accepted_hello: RemoteQuicAccepted = read_async_message(&mut client.recv, MAX_HELLO_SIZE)
-            .await
-            .expect("an enrolled device is accepted");
+        let accepted_hello: RemoteQuicAccepted =
+            read_async_message(&mut client.recv, MAX_HELLO_SIZE)
+                .await
+                .expect("an enrolled device is accepted");
         assert_eq!(accepted_hello.connection_generation, 1);
         drop(client);
 
-        let mut devices = crate::remote::device::DeviceList::load(&crate::remote::device::devices_path());
+        let mut devices =
+            crate::remote::device::DeviceList::load(&crate::remote::device::devices_path());
         devices.devices[0].revoked = true;
         devices
             .save(&crate::remote::device::devices_path())
             .expect("save revoked devices");
 
         let mut revoked = dial_with_hello_and_device(&record, 31, 2, Some(&identity)).await;
-        let refusal = read_async_message::<RemoteQuicAccepted>(&mut revoked.recv, MAX_HELLO_SIZE).await;
-        assert!(refusal.is_err(), "a revoked certificate must not be accepted");
+        let refusal =
+            read_async_message::<RemoteQuicAccepted>(&mut revoked.recv, MAX_HELLO_SIZE).await;
+        assert!(
+            refusal.is_err(),
+            "a revoked certificate must not be accepted"
+        );
     }
 
     #[tokio::test]
@@ -1267,8 +1271,7 @@ mod tests {
             .expect("an enrolled device reconnects after the token table dies");
         assert_eq!(accepted.connection_generation, 1);
         assert!(
-            lock(&server.state.tokens)
-                .contains_key(&hash_bytes(&record.capability_token)),
+            lock(&server.state.tokens).contains_key(&hash_bytes(&record.capability_token)),
             "the rebuilt capability is stored for the next reconnect"
         );
         drop(client);
@@ -1287,8 +1290,8 @@ mod tests {
         lock(&server.state.tokens).clear();
 
         let mut client = dial_with_hello_and_device(&record, 34, 0, Some(&identity)).await;
-        let refusal = read_async_message::<RemoteQuicAccepted>(&mut client.recv, MAX_HELLO_SIZE)
-            .await;
+        let refusal =
+            read_async_message::<RemoteQuicAccepted>(&mut client.recv, MAX_HELLO_SIZE).await;
         assert!(
             refusal.is_err(),
             "generation 0 with no stored capability must not be renewed"
@@ -2057,17 +2060,19 @@ mod tests {
 
     impl StateRoot {
         fn new(name: &str) -> Self {
-            let base = std::env::temp_dir().join(format!(
-                "herdr-quicid-{name}-{}",
-                std::process::id()
-            ));
+            let base =
+                std::env::temp_dir().join(format!("herdr-quicid-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&base).unwrap();
             let config = std::env::var_os("XDG_CONFIG_HOME");
             let state = std::env::var_os("XDG_STATE_HOME");
             std::env::set_var("XDG_CONFIG_HOME", base.join("config"));
             std::env::set_var("XDG_STATE_HOME", base.join("state"));
-            Self { base, config, state }
+            Self {
+                base,
+                config,
+                state,
+            }
         }
     }
 

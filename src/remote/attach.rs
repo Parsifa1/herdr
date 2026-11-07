@@ -558,9 +558,7 @@ impl RemoteHerdr {
     /// the host. Only `os` and the resolved executable are needed to *drive* a
     /// remote Herdr; the architecture is used solely to pick a download asset,
     /// so it stays unknown here rather than costing a round trip.
-    pub(super) fn from_metadata(
-        metadata: &crate::client::endpoint::SshMachineMetadata,
-    ) -> Self {
+    pub(super) fn from_metadata(metadata: &crate::client::endpoint::SshMachineMetadata) -> Self {
         let platform = RemotePlatform {
             os: if metadata.os == "windows" {
                 "windows"
@@ -5076,7 +5074,10 @@ mod tests {
             executable: r"C:\herdr\herdr.exe".into(),
         });
         assert_eq!(
-            windows.machine_metadata().expect("resolved path").executable,
+            windows
+                .machine_metadata()
+                .expect("resolved path")
+                .executable,
             r"C:\herdr\herdr.exe"
         );
     }

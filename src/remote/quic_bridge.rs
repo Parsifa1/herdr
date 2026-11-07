@@ -1234,7 +1234,12 @@ fn bootstrap_credential(config: &QuicBridgeConfig, key: &CredentialKey) -> Resul
     }
     let candidates =
         remote_quic_candidates(&hostname, record.port).map_err(|err| err.to_string())?;
-    store_credential(&mut lock(&CREDENTIAL_CACHE), key.clone(), record, candidates);
+    store_credential(
+        &mut lock(&CREDENTIAL_CACHE),
+        key.clone(),
+        record,
+        candidates,
+    );
     Ok(())
 }
 
@@ -1479,17 +1484,19 @@ mod tests {
 
     impl StateDir {
         fn new(name: &str) -> Self {
-            let base = std::env::temp_dir().join(format!(
-                "herdr-quicstate-{name}-{}",
-                std::process::id()
-            ));
+            let base =
+                std::env::temp_dir().join(format!("herdr-quicstate-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&base).expect("test state root");
             let config = std::env::var_os("XDG_CONFIG_HOME");
             let state = std::env::var_os("XDG_STATE_HOME");
             std::env::set_var("XDG_CONFIG_HOME", base.join("config"));
             std::env::set_var("XDG_STATE_HOME", base.join("state"));
-            Self { base, config, state }
+            Self {
+                base,
+                config,
+                state,
+            }
         }
     }
 
@@ -1515,7 +1522,10 @@ mod tests {
         let prefix = command
             .find(&assignment)
             .expect("the label travels in the environment");
-        assert_eq!(prefix, 0, "a shell only files an assignment as one when it leads the command");
+        assert_eq!(
+            prefix, 0,
+            "a shell only files an assignment as one when it leads the command"
+        );
         assert!(
             command.contains("remote-quic-bootstrap "),
             "the helper subcommand survives: {command}"

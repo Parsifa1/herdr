@@ -52,9 +52,10 @@ pub(crate) fn run_remote_quic_bootstrap(args: &[String]) -> io::Result<()> {
         [id] => (id.as_str(), None),
         [id, certificate] => (
             id.as_str(),
-            Some(super::device::decode_hex(certificate).map_err(|err| {
-                io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
-            })?),
+            Some(
+                super::device::decode_hex(certificate)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?,
+            ),
         ),
         _ => {
             return Err(io::Error::new(
