@@ -14,10 +14,6 @@ use super::private_file;
 pub(crate) const CLIENT_KEY_FILE: &str = "client.key";
 pub(crate) const DEVICES_FILE: &str = "devices";
 
-// 16-byte PKCS#8 v1 prefix plus a 32-byte Ed25519 seed.
-#[cfg(test)]
-const PKCS8_ED25519_PRIVATE_KEY_LEN: usize = 48;
-
 /// The local device's key and its self-signed certificate, in one PEM bundle:
 /// the key as PKCS#8 so `openssl pkey -in` reads it, the certificate beside it
 /// because its digest — which the server authorizes — must stay stable across
@@ -91,6 +87,11 @@ impl DeviceIdentity {
 
     pub(crate) fn certificate_der(&self) -> Vec<u8> {
         self.certificate_der.clone()
+    }
+
+    #[cfg(test)]
+    fn private_key_der(&self) -> &[u8] {
+        &self.private_key_der
     }
 
     /// The TLS client configuration that presents this device.
@@ -427,7 +428,11 @@ mod tests {
     fn a_corrupt_devices_file_is_an_error_not_an_empty_list() {
         let dir = scratch("corrupt");
         let path = dir.join("devices");
-        std::fs::write(&path, b"{\"name\":\"a\"}\n{not json\n").unwrap();
+        std::fs::write(
+            &path,
+            b"{\"name\":\"a\",\"certificate_sha256\":\"00\"}\n{not json\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let err = DeviceList::try_load(&path).expect_err("a corrupt list must not read as empty");
         assert!(err.to_string().contains(":2:"), "{err}");
@@ -504,9 +509,13 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        let (key, _) = private_file::pem_read_key_and_certificate(&text).unwrap();
-        assert_eq!(key.len(), PKCS8_ED25519_PRIVATE_KEY_LEN);
-        assert!(!identity.certificate_der().is_empty());
+        let (key, certificate) = private_file::pem_read_key_and_certificate(&text).unwrap();
+        assert_eq!(
+            key,
+            identity.private_key_der(),
+            "the PEM bundle round-trips the key it was written from"
+        );
+        assert_eq!(certificate, identity.certificate_der());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
