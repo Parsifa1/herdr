@@ -188,6 +188,9 @@ struct Fixture {
     state_home: PathBuf,
     path_env: String,
     ssh_commands: PathBuf,
+    /// Held only so the spawned processes die with the fixture: the field is
+    /// never read, and its `Drop` is the entire point.
+    #[allow(dead_code)]
     cleanup: TestCleanup,
 }
 

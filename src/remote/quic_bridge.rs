@@ -294,6 +294,10 @@ enum LadderStep {
 }
 
 #[derive(Debug)]
+// The ladder only reacts to dial failures in production; the remaining events
+// pin what the state machine is supposed to do for the cases the run loop does
+// not yet drive, so they are constructed only by the tests below.
+#[cfg_attr(not(test), allow(dead_code))]
 enum LadderEvent {
     /// A usable credential is cached.
     Bootstrapped,
@@ -782,7 +786,10 @@ enum PumpExit {
     /// The thin client hung up.
     LocalClosed,
     /// The pipe ended locally — path lost, stream error — so the next
-    /// connection has to be a brand-new one.
+    /// connection has to be a brand-new one. The reason is carried for
+    /// `Debug` output: the manager restarts the dial either way, so nothing
+    /// branches on it, in any build.
+    #[allow(dead_code)]
     Ended(String),
 }
 
