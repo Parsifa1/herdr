@@ -37,6 +37,9 @@ fn unique_profile(nonce: u128) -> String {
     format!("{nonce:032x}")
 }
 
+/// How much rendered output counts as "the client drew a screen".
+const RENDERED_OUTPUT_BYTES: usize = 2000;
+
 fn unique_dir(_prefix: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
