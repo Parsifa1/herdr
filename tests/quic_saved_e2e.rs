@@ -266,7 +266,7 @@ fn cold_start_bootstraps_over_ssh_then_the_daemon_serves_the_rest() {
 
     let stable_socket = crate_persisted_path(&temp_dir);
     let _ = fs::remove_file(&stable_socket);
-    let daemon_log = state_home.join("herdr-dev/herdr-remote-bridge-daemon.log");
+    let daemon_log = config_home.join("herdr-dev/herdr-remote-bridge-daemon.log");
 
     // Cold: no daemon yet. The client spawns one, which discovers the remote
     // host over SSH and bootstraps a credential.

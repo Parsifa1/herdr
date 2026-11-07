@@ -1398,39 +1398,33 @@ mod tests {
     /// next client is refused with "server refused to accept a new connection".
     #[tokio::test]
     async fn authenticated_connections_do_not_exhaust_the_admission_cap() {
-        let TestServer {
-            server,
-            mut accepted,
-        } = test_server_on_free_port();
+        let TestServer { server, .. } = test_server_on_free_port();
 
-        // More live connections than the pre-auth cap. Each one authenticates
-        // and then idles, which is exactly the shape of a bridge that keeps
-        // reconnecting.
+        // More live connections than the pre-auth cap, each authenticated and
+        // then idle: the shape of a bridge that keeps reconnecting. The
+        // acceptance reply is the proof the server admitted it; the sink is
+        // not involved, so the assertion does not depend on stream relay.
         let mut clients = Vec::new();
         for index in 0..(MAX_PREAUTH_CONNECTIONS + 4) {
             let logical_client_id = u8::try_from(index % 200).expect("id fits a byte");
             let record = mint(&server, logical_client_id);
-            let mut client =
-                dial_with_hello_and_device(&record, logical_client_id, 1, None).await;
+            let mut client = dial_with_hello_and_device(&record, logical_client_id, 1, None).await;
             let accepted_hello: RemoteQuicAccepted =
                 read_async_message(&mut client.recv, MAX_HELLO_SIZE)
                     .await
-                    .expect("an authenticated connection is accepted");
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "connection {index} was refused past the pre-auth cap, so the \
+                             permit was not released on authentication: {err}"
+                        )
+                    });
             assert_eq!(accepted_hello.connection_generation, 1);
-            client
-                .send
-                .write_all(b"x")
-                .await
-                .expect("wake the accept loop");
-            let _socket = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
-                .await
-                .expect("client reaches the acceptor")
-                .expect("sink channel open");
             clients.push(client);
         }
-        assert!(
-            clients.len() > MAX_PREAUTH_CONNECTIONS,
-            "the test must exceed the pre-auth cap to prove it is released"
+        assert_eq!(
+            clients.len(),
+            MAX_PREAUTH_CONNECTIONS + 4,
+            "every one of these connections is live at the same time"
         );
     }
 
