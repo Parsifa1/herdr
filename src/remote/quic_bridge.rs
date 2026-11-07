@@ -1266,24 +1266,23 @@ fn remote_quic_bootstrap_command(
     logical_client_id: &[u8; REMOTE_QUIC_ID_BYTES],
     certificate: Option<&str>,
 ) -> String {
-    let mut command = format!(
+    let mut args = format!(
         "remote-quic-bootstrap {}",
         format_logical_client_id(logical_client_id)
     );
     if let Some(certificate) = certificate {
-        command.push(' ');
-        command.push_str(certificate);
-        // The helper runs on the server, so it cannot name this machine. The
-        // label rides in an environment assignment rather than an argument:
-        // an older server rejects any argument list it does not recognise,
-        // which would cost the whole QUIC path instead of just the name.
-        command = format!(
-            "{} -- {}",
-            device_label_assignment(),
-            command
-        );
+        args.push(' ');
+        args.push_str(certificate);
     }
-    remote_session_command(remote_herdr, session, &command)
+    let command = remote_session_command(remote_herdr, session, &args);
+    if certificate.is_none() {
+        return command;
+    }
+    // The helper runs on the server, so it cannot name this machine. The label
+    // rides in an environment assignment rather than an argument: an older
+    // server rejects any argument list it does not recognise, which would cost
+    // the whole QUIC path instead of just the name.
+    format!("{} {command}", device_label_assignment())
 }
 
 fn device_label_assignment() -> String {
@@ -1474,6 +1473,36 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.base);
         }
+    }
+
+    #[test]
+    fn the_bootstrap_command_puts_the_label_before_the_executable() {
+        let remote = RemoteHerdr::for_test_binary(std::path::Path::new("/nonexistent/herdr"));
+        let command = remote_quic_bootstrap_command(&remote, "default", &[0xab; 16], Some("cafe"));
+        let assignment = format!("{}=", crate::remote::host::DEVICE_LABEL_ENV_VAR);
+        let prefix = command
+            .find(&assignment)
+            .expect("the label travels in the environment");
+        assert_eq!(prefix, 0, "a shell only files an assignment as one when it leads the command");
+        assert!(
+            command.contains("remote-quic-bootstrap "),
+            "the helper subcommand survives: {command}"
+        );
+        assert_eq!(
+            command.matches("remote-quic-bootstrap").count(),
+            1,
+            "the helper is named once: {command}"
+        );
+    }
+
+    #[test]
+    fn the_bootstrap_command_omits_the_label_when_not_enrolling() {
+        let remote = RemoteHerdr::for_test_binary(std::path::Path::new("/nonexistent/herdr"));
+        let command = remote_quic_bootstrap_command(&remote, "default", &[0xab; 16], None);
+        assert!(
+            !command.contains(crate::remote::host::DEVICE_LABEL_ENV_VAR),
+            "a plain credential request needs no label: {command}"
+        );
     }
 
     #[test]
