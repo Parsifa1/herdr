@@ -72,9 +72,6 @@ const QUIC_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(4);
 /// Rejected dials tolerated in one run before handing the connection to SSH.
 /// Backoff alone cannot repair a credential the server keeps refusing.
 const MAX_CONSECUTIVE_QUIC_RETRIES: u32 = 5;
-/// TCP connect budget for the SSH reachability probe that decides whether a
-/// QUIC dial timeout means "UDP is filtered" or "the network is down".
-const SSH_REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Application close code the bridge sends when it tears a connection down.
 /// The server never interprets a client's close code — it only sees the
 /// connection end — so one code covers every bridge-side close.
@@ -285,9 +282,6 @@ enum LadderStep {
     SshFallback(String),
     /// Close the local socket and let the thin client reconnect.
     CloseLocal(String),
-    /// A dial to a server that has already carried QUIC timed out: check
-    /// whether the SSH port answers before conceding the connection to SSH.
-    ProbeSsh(String),
 }
 
 #[derive(Debug)]
@@ -305,12 +299,6 @@ enum LadderEvent {
     ConnectFailed(ConnectError),
     /// A live session ended.
     SessionEnded(SessionExit),
-    /// The SSH port accepted a TCP connection: the network is up, so a QUIC
-    /// timeout means UDP really is filtered on this path.
-    SshReachable,
-    /// The SSH port did not answer either: the whole network is down, and
-    /// nothing is gained by trying to carry the client over SSH.
-    SshUnreachable(String),
 }
 
 /// Budget spent by one ladder run. A run covers a single local connection, so
@@ -321,12 +309,8 @@ struct LadderState {
     rejected_dials: u32,
     /// Whether this run already minted a fresh credential.
     rebootstrapped: bool,
-    /// Whether the credential in hand has carried a live QUIC session before.
-    /// A proven credential turns a dial timeout from "UDP is filtered here"
-    /// into "the network is probably down", which SSH cannot fix either.
-    credential_proven: bool,
-    /// Whether this run already re-dialed QUIC after the SSH port answered.
-    redialed_after_probe: bool,
+    /// Whether this run already re-dialed QUIC after a dial timed out.
+    redialed_after_timeout: bool,
 }
 
 /// The ladder, as a pure function of the run's budget and the latest event.
@@ -347,30 +331,20 @@ fn next_step(state: &mut LadderState, event: LadderEvent) -> LadderStep {
         // reuses the cached credential, so it costs no SSH.
         LadderEvent::SessionEnded(exit) => LadderStep::CloseLocal(exit.to_string()),
         // A dial that never reached the server says nothing about the
-        // credential: only the path is suspect. On a path that never carried
-        // QUIC, SSH is the answer. On one that did, an outage is far likelier
-        // than a UDP filter appearing mid-session, and conceding to SSH at the
-        // first sign of it would strand the client on SSH for the rest of the
-        // connection the moment the network returns.
+        // credential: only the path is suspect. One retry is cheap and absorbs
+        // a single lost handshake; a second timeout means this path is not
+        // carrying QUIC, so SSH carries the connection instead.
         LadderEvent::ConnectFailed(ConnectError::Timeout(detail)) => {
-            if state.credential_proven && !state.redialed_after_probe {
-                LadderStep::ProbeSsh(detail)
-            } else {
+            if state.redialed_after_timeout {
                 LadderStep::SshFallback(detail)
+            } else {
+                state.redialed_after_timeout = true;
+                LadderStep::ConnectQuic {
+                    delay: Duration::ZERO,
+                }
             }
         }
         LadderEvent::ConnectFailed(ConnectError::Other(detail)) => LadderStep::SshFallback(detail),
-        // The network is up and UDP still failed: SSH gets one more QUIC dial
-        // to beat before it carries the connection.
-        LadderEvent::SshReachable => {
-            state.redialed_after_probe = true;
-            LadderStep::ConnectQuic {
-                delay: Duration::ZERO,
-            }
-        }
-        // Nothing answers. Give the connection back so the thin client's
-        // supervisor paces the retries; the next one dials QUIC first again.
-        LadderEvent::SshUnreachable(detail) => LadderStep::CloseLocal(detail),
         LadderEvent::ConnectFailed(ConnectError::Rejected(SessionExit::Superseded)) => {
             LadderStep::CloseLocal(SessionExit::Superseded.to_string())
         }
@@ -616,18 +590,6 @@ fn acquire_shared_session(
                     }
                 },
                 Err(detail) => {
-                    report_bridge_error(config, &detail);
-                    return Acquired::Ssh;
-                }
-            },
-            LadderStep::ProbeSsh(detail) => match ssh_port_reachable(config) {
-                Ok(()) => {
-                    debug!(target = %config.target, %detail, "SSH port answers; re-dialing QUIC once");
-                    step = LadderStep::ConnectQuic {
-                        delay: Duration::ZERO,
-                    };
-                }
-                Err(_) => {
                     report_bridge_error(config, &detail);
                     return Acquired::Ssh;
                 }
@@ -1389,25 +1351,6 @@ fn resolve_ssh_endpoint(config: &QuicBridgeConfig) -> io::Result<(String, u16)> 
     Ok((hostname, port))
 }
 
-/// Whether the SSH port completes a TCP handshake inside
-/// [`SSH_REACHABILITY_TIMEOUT`]. Distinguishes a filtered UDP path (SSH
-/// answers) from a dead network (nothing answers) without spawning ssh or
-/// authenticating.
-fn ssh_port_reachable(config: &QuicBridgeConfig) -> io::Result<()> {
-    let (hostname, port) = resolve_ssh_endpoint(config)?;
-    let mut last_error = io::Error::new(
-        io::ErrorKind::AddrNotAvailable,
-        format!("SSH hostname {hostname} has no IP addresses"),
-    );
-    for address in (hostname.as_str(), port).to_socket_addrs()? {
-        match std::net::TcpStream::connect_timeout(&address, SSH_REACHABILITY_TIMEOUT) {
-            Ok(_) => return Ok(()),
-            Err(err) => last_error = err,
-        }
-    }
-    Err(last_error)
-}
-
 fn remote_quic_candidates(hostname: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     let mut seen = HashSet::new();
     // IPv6 first, then IPv4: the dial set is staggered in this order, so this
@@ -1823,48 +1766,17 @@ mod tests {
     }
 
     #[test]
-    fn a_proven_path_checks_ssh_before_conceding_to_it() {
-        let mut state = LadderState {
-            credential_proven: true,
-            ..LadderState::default()
-        };
+    fn a_quic_timeout_gets_one_redial_before_ssh() {
+        let mut state = LadderState::default();
         let timeout = || LadderEvent::ConnectFailed(ConnectError::Timeout("no answer".to_owned()));
-        // Network down: nothing answers, so hand the connection back for a
-        // paced retry instead of stranding it on SSH once the network returns.
         assert_eq!(
             next_step(&mut state, timeout()),
-            LadderStep::ProbeSsh("no answer".to_owned())
-        );
-        assert_eq!(
-            next_step(&mut state, LadderEvent::SshUnreachable("down".to_owned())),
-            LadderStep::CloseLocal("down".to_owned())
-        );
-
-        // UDP filtered: the SSH port answers, QUIC gets exactly one more dial,
-        // and a second timeout concedes the connection to SSH.
-        let mut state = LadderState {
-            credential_proven: true,
-            ..LadderState::default()
-        };
-        assert!(matches!(
-            next_step(&mut state, timeout()),
-            LadderStep::ProbeSsh(_)
-        ));
-        assert_eq!(
-            next_step(&mut state, LadderEvent::SshReachable),
             LadderStep::ConnectQuic {
                 delay: Duration::ZERO
             }
         );
         assert_eq!(
             next_step(&mut state, timeout()),
-            LadderStep::SshFallback("no answer".to_owned())
-        );
-
-        // A credential that never carried QUIC keeps the plain fallback.
-        let mut fresh = LadderState::default();
-        assert_eq!(
-            next_step(&mut fresh, timeout()),
             LadderStep::SshFallback("no answer".to_owned())
         );
     }
