@@ -130,6 +130,14 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
         "ZELLIJ",
         "ZELLIJ_SESSION_NAME",
         "ZELLIJ_PANE_ID",
+        // The server may itself have been started from an SSH session — or
+        // inherited one through whatever spawned it — and outlives that
+        // session. A pane is a new process tree on this host, so leaving them
+        // set makes programs, and clients started inside a pane, treat a local
+        // session as a remote one.
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
     ] {
         cmd.env_remove(key);
     }
@@ -4382,6 +4390,9 @@ mod tests {
             "ZELLIJ",
             "ZELLIJ_SESSION_NAME",
             "ZELLIJ_PANE_ID",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
         ];
         let mut cmd = CommandBuilder::new("shell");
         for key in keys {
