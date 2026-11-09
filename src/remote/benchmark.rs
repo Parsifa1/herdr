@@ -914,8 +914,10 @@ fn remote_quic_3g_benchmark() {
         record.port, relay.address
     );
 
-    // The bridge never runs SSH: the credential is planted, and its dial
-    // candidate is the relay, so every QUIC packet crosses the shaped hop.
+    // The bridge never runs SSH: the credential is planted, and its hostname
+    // resolves to the relay, so every QUIC packet crosses the shaped hop.
+    let mut record = record.clone();
+    record.port = relay.address.port();
     let bridge_config = QuicBridgeConfig {
         target: format!("quic-bench-{}", std::process::id()),
         remote_herdr: RemoteHerdr::for_test_binary(Path::new("/nonexistent/herdr")),
@@ -925,7 +927,7 @@ fn remote_quic_3g_benchmark() {
         transport: RemoteTransportConfig::Auto,
         logical_client_id,
     };
-    seed_credential_for_test(&bridge_config, record.clone(), vec![relay.address]);
+    seed_credential_for_test(&bridge_config, record, "127.0.0.1");
 
     let mut arms = Vec::new();
     let mut blackouts = Vec::new();

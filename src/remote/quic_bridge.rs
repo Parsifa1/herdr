@@ -554,9 +554,18 @@ fn acquire_shared_session(
                 if !sleep_interruptible(delay, should_stop) {
                     return Acquired::Stopped;
                 }
+                // Resolved per attempt, not cached with the credential: an
+                // address that changed since the bootstrap must not outlive it.
+                let candidates = match remote_quic_candidates(&dial.hostname, dial.record.port) {
+                    Ok(candidates) => candidates,
+                    Err(err) => {
+                        report_bridge_error(config, &err.to_string());
+                        return Acquired::Ssh;
+                    }
+                };
                 let dial_started = Instant::now();
                 let params = QuicClientParams {
-                    candidates: dial.candidates.clone(),
+                    candidates,
                     fingerprint: dial.record.certificate_fingerprint,
                     hello: RemoteQuicHello {
                         schema_version: REMOTE_QUIC_SCHEMA_VERSION,
@@ -960,18 +969,23 @@ fn into_std_stream(stream: crate::ipc::LocalStream) -> io::Result<std::os::unix:
 /// A credential reserved for one dial.
 struct Credential {
     record: RemoteBootstrapRecord,
-    candidates: Vec<SocketAddr>,
+    /// Host to resolve the dial addresses from, captured from `ssh -G` at
+    /// bootstrap. Only the host is stored: a resolved address would pin the
+    /// dial to whatever DNS said once, so an address change would never be
+    /// picked up.
+    hostname: String,
 }
 
 #[derive(Serialize, Deserialize)]
 struct CachedCredential {
     record: RemoteBootstrapRecord,
-    candidates: Vec<SocketAddr>,
+    #[serde(default)]
+    hostname: String,
     /// Set once a dial with this credential reached a live session.
     proven: bool,
 }
 
-/// Keyed by target and session, which is exactly what the token is scoped to.
+/// Keyed by target and session.
 type CredentialKey = (String, String);
 type CredentialCache = HashMap<CredentialKey, CachedCredential>;
 
@@ -980,7 +994,8 @@ struct StoredCredential {
     target: String,
     session: String,
     record: StoredRecord,
-    candidates: Vec<SocketAddr>,
+    #[serde(default)]
+    hostname: String,
     proven: bool,
 }
 
@@ -1075,7 +1090,7 @@ fn load_credential_cache() -> CredentialCache {
                 (entry.target, entry.session),
                 CachedCredential {
                     record,
-                    candidates: entry.candidates,
+                    hostname: entry.hostname,
                     proven: entry.proven,
                 },
             ))
@@ -1094,7 +1109,7 @@ fn save_credential_cache(cache: &CredentialCache) -> io::Result<()> {
             target: target.clone(),
             session: session.clone(),
             record: StoredRecord::encode(&entry.record),
-            candidates: entry.candidates.clone(),
+            hostname: entry.hostname.clone(),
             proven: entry.proven,
         })
         .collect::<Vec<_>>();
@@ -1128,27 +1143,31 @@ fn credential_key(config: &QuicBridgeConfig) -> CredentialKey {
     (config.target.clone(), config.session.clone())
 }
 
+/// The cached connection information for `key`, if the cache has any.
+///
+/// An entry with no hostname predates the field; answering it would need a
+/// dial address this build no longer stores, so it reads as a miss and the
+/// next bootstrap writes one.
 fn cached_credential(key: &CredentialKey) -> Option<Credential> {
     update_credential_cache(|cache| {
         let entry = cache.get(key)?;
+        if entry.hostname.is_empty() {
+            return None;
+        }
         Some(Credential {
             record: entry.record.clone(),
-            candidates: entry.candidates.clone(),
+            hostname: entry.hostname.clone(),
         })
     })
 }
 
-fn store_credential(
-    key: CredentialKey,
-    record: RemoteBootstrapRecord,
-    candidates: Vec<SocketAddr>,
-) {
+fn store_credential(key: CredentialKey, record: RemoteBootstrapRecord, hostname: String) {
     update_credential_cache(|cache| {
         cache.insert(
             key,
             CachedCredential {
                 record,
-                candidates,
+                hostname,
                 proven: false,
             },
         );
@@ -1177,9 +1196,9 @@ fn drop_credential(key: &CredentialKey) {
 pub(super) fn seed_credential_for_test(
     config: &QuicBridgeConfig,
     record: RemoteBootstrapRecord,
-    candidates: Vec<SocketAddr>,
+    hostname: &str,
 ) {
-    store_credential(credential_key(config), record, candidates);
+    store_credential(credential_key(config), record, hostname.to_owned());
 }
 
 #[cfg(test)]
@@ -1215,9 +1234,7 @@ fn bootstrap_credential(config: &QuicBridgeConfig, key: &CredentialKey) -> Resul
             record.schema_version
         ));
     }
-    let candidates =
-        remote_quic_candidates(&hostname, record.port).map_err(|err| err.to_string())?;
-    store_credential(key.clone(), record, candidates);
+    store_credential(key.clone(), record, hostname);
     Ok(())
 }
 
@@ -1434,8 +1451,8 @@ mod tests {
         ("fedora".to_owned(), "default".to_owned())
     }
 
-    fn store(key: CredentialKey, record: RemoteBootstrapRecord, candidates: Vec<SocketAddr>) {
-        store_credential(key, record, candidates);
+    fn store(key: CredentialKey, record: RemoteBootstrapRecord, hostname: &str) {
+        store_credential(key, record, hostname.to_owned());
     }
 
     fn cached(key: &CredentialKey) -> Option<Credential> {
@@ -1531,27 +1548,23 @@ mod tests {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("roundtrip");
 
-        store(
-            key(),
-            record(),
-            vec![SocketAddr::from(([127, 0, 0, 1], 48_000))],
-        );
+        store(key(), record(), "localhost");
 
         let reloaded = load_credential_cache();
         let entry = reloaded.get(&key()).expect("credential reloaded");
         assert_eq!(entry.record.port, 48_001);
-        assert_eq!(entry.candidates.len(), 1);
+        assert_eq!(entry.hostname, "localhost");
     }
 
     #[test]
     fn hosts_json_is_pretty_printed_with_one_entry_per_target() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("ndjson");
-        store(key(), record(), Vec::new());
+        store(key(), record(), "localhost");
         store(
             ("phone".to_owned(), "default".to_owned()),
             record(),
-            Vec::new(),
+            "localhost",
         );
 
         let text = std::fs::read_to_string(hosts_path()).unwrap();
@@ -1564,7 +1577,7 @@ mod tests {
     fn a_credential_is_written_as_base64_over_a_handful_of_lines() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("base64");
-        store(key(), record(), Vec::new());
+        store(key(), record(), "localhost");
 
         let text = std::fs::read_to_string(hosts_path()).unwrap();
         assert!(
@@ -1610,8 +1623,8 @@ mod tests {
         // re-read under the lock instead of replaying its own snapshot.
         let apfel = ("apfel".to_owned(), "default".to_owned());
         let debian = ("debian".to_owned(), "default".to_owned());
-        store(apfel.clone(), record(), Vec::new());
-        store(debian.clone(), record(), Vec::new());
+        store(apfel.clone(), record(), "localhost");
+        store(debian.clone(), record(), "localhost");
         drop_credential(&apfel);
 
         let remaining = load_credential_cache();
@@ -1624,10 +1637,10 @@ mod tests {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("proven");
         let other = ("debian".to_owned(), "default".to_owned());
-        store(key(), record(), Vec::new());
+        store(key(), record(), "localhost");
         mark_credential_proven(&key());
         // A second daemon writing its own row must not reset the first's flag.
-        store(other.clone(), record(), Vec::new());
+        store(other.clone(), record(), "localhost");
 
         let cache = load_credential_cache();
         assert!(cache.get(&key()).expect("first entry").proven);
@@ -1658,7 +1671,7 @@ mod tests {
     fn a_stored_record_dials_without_any_expiry() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("no-expiry");
-        store(key(), record(), Vec::new());
+        store(key(), record(), "localhost");
 
         let reserved = cached(&key()).expect("a stored record still dials");
         assert_eq!(reserved.record.port, 48_001);
@@ -1994,7 +2007,7 @@ mod tests {
     fn hosts_json_names_no_client_state() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("client-id");
-        store(key(), record(), Vec::new());
+        store(key(), record(), "localhost");
 
         let text = std::fs::read_to_string(hosts_path()).unwrap();
         for forbidden in ["logical_client_id", "generation"] {
@@ -2009,7 +2022,7 @@ mod tests {
     fn a_credential_hit_never_reaches_ssh() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("no-ssh");
-        store(key(), record(), Vec::new());
+        store(key(), record(), "localhost");
 
         // No server is running and no SSH target exists, so any attempt to
         // bootstrap would fail rather than silently succeed. Reaching the
@@ -2105,11 +2118,7 @@ mod tests {
             transport: RemoteTransportConfig::Auto,
             logical_client_id: [5; REMOTE_QUIC_ID_BYTES],
         };
-        seed_credential_for_test(
-            &bridge_config,
-            record,
-            vec![SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))],
-        );
+        seed_credential_for_test(&bridge_config, record, "127.0.0.1");
 
         let local_socket =
             std::env::temp_dir().join(format!("herdr-mux-test-{}.sock", std::process::id()));
