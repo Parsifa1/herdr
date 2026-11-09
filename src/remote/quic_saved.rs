@@ -15,11 +15,16 @@ use super::saved::validated_saved_ssh;
 
 const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(crate) fn persisted_bridge_path(profile_id: &str, target: &str, session: &str) -> PathBuf {
+pub(crate) fn persisted_bridge_path(
+    profile_id: &str,
+    target: &str,
+    session: &str,
+) -> io::Result<PathBuf> {
     let hash = persisted_socket_hash(profile_id, target, session);
     let readable = format!("herdr-qp-{profile_id}-{hash}.sock");
     let short = format!("herdr-q-{}-{hash}.sock", &profile_id[..16]);
-    crate::platform::remote_bridge_endpoint_path(&readable, &short)
+    let dir = crate::platform::remote_bridge_socket_dir()?;
+    crate::platform::remote_bridge_endpoint_path(&dir, &readable, &short)
 }
 
 fn persisted_socket_hash(profile_id: &str, target: &str, session: &str) -> String {
@@ -50,7 +55,7 @@ pub(crate) fn connect_persisted_quic(
     crate::session::validate_name(session)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
-    let path = persisted_bridge_path(profile_id, target, session);
+    let path = persisted_bridge_path(profile_id, target, session)?;
     if crate::ipc::connect_local_stream(&path).is_ok() {
         return connect_stream(&path, &cancelled);
     }
@@ -143,7 +148,7 @@ pub(crate) fn run_remote_bridge_daemon(args: &[String]) -> io::Result<()> {
         Some(metadata) => RemoteHerdr::from_metadata(&metadata),
         None => find_installed_remote_herdr(&ssh)?,
     };
-    let path = persisted_bridge_path(profile_id, target, session);
+    let path = persisted_bridge_path(profile_id, target, session)?;
 
     let bridge = QuicBridge::start(
         QuicBridgeConfig {

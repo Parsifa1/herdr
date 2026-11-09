@@ -55,9 +55,9 @@ impl HeadlessServer {
         }
 
         // Exported before any client is disconnected so the successor inherits
-        // the UDP sockets, certificate, instance id, and live capabilities.
-        // Remote clients then reconnect with the token they already hold
-        // instead of running a fresh SSH bootstrap.
+        // the UDP sockets, certificate, and instance id. Remote clients then
+        // reconnect with the device certificate they already enrolled instead
+        // of running a fresh SSH bootstrap.
         let (remote_quic_state, remote_quic_sockets) = match self.remote_quic.as_ref() {
             Some(server) => match server.export_handoff() {
                 Ok((state, sockets)) => (Some(state), sockets),
@@ -234,8 +234,8 @@ impl HeadlessServer {
         }
         // Committed: the successor owns the session, so the endpoints this
         // process still holds on the inherited sockets have to go. Connected
-        // clients see a handoff close and reconnect with the capability they
-        // already hold. Every path above this point leaves the endpoint
+        // clients see a handoff close and reconnect with the device certificate
+        // they already enrolled. Every path above this point leaves the endpoint
         // serving, so a rollback keeps remote clients connected.
         if let Some(server) = self.remote_quic.take() {
             server.close_for_handoff();

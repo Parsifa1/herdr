@@ -63,7 +63,7 @@ pub(crate) fn connect_saved_ssh(
     if cancelled.load(Ordering::Acquire) {
         return Err(super::process::cancelled());
     }
-    let path = saved_bridge_path(profile_id);
+    let path = saved_bridge_path(profile_id)?;
     #[cfg(unix)]
     let bridge = QuicBridge::start(
         QuicBridgeConfig {
@@ -143,14 +143,16 @@ impl SavedSshApiBridge {
             }
         };
         let command = super::attach::cached_remote_api_command(&metadata, session);
+        let dir = crate::platform::remote_bridge_socket_dir()?;
         let path = crate::platform::remote_bridge_endpoint_path(
+            &dir,
             &format!("herdr-api-ssh-{}-{profile_id}.sock", std::process::id()),
             &format!(
                 "herdr-api-{}-{}.sock",
                 std::process::id(),
                 &profile_id[..16]
             ),
-        );
+        )?;
         let bridge = SshStdioBridge::start_command(
             target.to_owned(),
             command,
@@ -227,11 +229,12 @@ pub(crate) fn saved_ssh_failure_needs_attention(error: &io::Error) -> bool {
     .any(|needle| message.contains(needle))
 }
 
-fn saved_bridge_path(profile_id: &str) -> PathBuf {
+fn saved_bridge_path(profile_id: &str) -> std::io::Result<PathBuf> {
     let pid = std::process::id();
     let readable = format!("herdr-ssh-{pid}-{profile_id}.sock");
     let short = format!("herdr-s-{pid}-{}.sock", &profile_id[..16]);
-    crate::platform::remote_bridge_endpoint_path(&readable, &short)
+    let dir = crate::platform::remote_bridge_socket_dir()?;
+    crate::platform::remote_bridge_endpoint_path(&dir, &readable, &short)
 }
 
 pub(super) fn validated_saved_ssh(
@@ -266,8 +269,8 @@ mod tests {
 
     #[test]
     fn bridge_paths_use_profile_identity_not_target_or_session() {
-        let first = saved_bridge_path("0123456789abcdef0123456789abcdef");
-        let second = saved_bridge_path("fedcba9876543210fedcba9876543210");
+        let first = saved_bridge_path("0123456789abcdef0123456789abcdef").expect("socket path");
+        let second = saved_bridge_path("fedcba9876543210fedcba9876543210").expect("socket path");
         assert_ne!(first, second);
         assert!(!first.to_string_lossy().contains("example.com"));
         assert!(!first.to_string_lossy().contains("default"));

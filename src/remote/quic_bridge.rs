@@ -75,10 +75,6 @@ const MAX_CONSECUTIVE_QUIC_RETRIES: u32 = 5;
 /// TCP connect budget for the SSH reachability probe that decides whether a
 /// QUIC dial timeout means "UDP is filtered" or "the network is down".
 const SSH_REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
-/// A cached credential is treated as spent this long before its real deadline,
-/// so a dial started now cannot lose a race against the server's own expiry
-/// check.
-const CREDENTIAL_EXPIRY_SLACK: Duration = Duration::from_secs(30);
 /// Application close code the bridge sends when it tears a connection down.
 /// The server never interprets a client's close code — it only sees the
 /// connection end — so one code covers every bridge-side close.
@@ -101,15 +97,16 @@ pub(crate) struct QuicBridgeConfig {
 }
 
 impl QuicBridgeConfig {
-    /// One logical client per process: the token a bootstrap mints is scoped
-    /// to it, and every local connection this process's bridges accept
-    /// reconnects as the same logical client with a newer generation.
+    /// Names this process as one client slot, fixed for its life. Two bridges
+    /// on one device must not evict each other, and a restarted daemon must
+    /// look like a new client rather than fight its own predecessor, so it is
+    /// random per process and never persisted.
     pub(crate) fn process_logical_client_id() -> [u8; REMOTE_QUIC_ID_BYTES] {
         static ID: LazyLock<[u8; REMOTE_QUIC_ID_BYTES]> = LazyLock::new(|| {
             let mut id = [0u8; REMOTE_QUIC_ID_BYTES];
             if let Err(err) = getrandom::fill(&mut id) {
-                // Fall back to process identity: the id only namespaces the
-                // token; the token itself is the secret.
+                // Fall back to process identity: the id only names a slot, and
+                // nothing is authorized by it.
                 warn!(%err, "system randomness unavailable for the remote client id");
                 let pid = std::process::id().to_le_bytes();
                 let nanos = std::time::SystemTime::now()
@@ -564,9 +561,7 @@ fn acquire_shared_session(
                     hello: RemoteQuicHello {
                         schema_version: REMOTE_QUIC_SCHEMA_VERSION,
                         server_instance_id: dial.record.server_instance_id,
-                        logical_client_id: dial.logical_client_id,
-                        capability_token: dial.record.capability_token,
-                        connection_generation: dial.generation,
+                        logical_client_id: config.logical_client_id,
                     },
                 };
                 let event = match runtime.block_on(QuicSession::connect(params)) {
@@ -581,7 +576,6 @@ fn acquire_shared_session(
                         let session = connected;
                         info!(
                             target = %config.target,
-                            generation = dial.generation,
                             elapsed_ms = dial_started.elapsed().as_millis() as u64,
                             since_start_ms = process_uptime_ms(),
                             "remote QUIC transport connected"
@@ -967,25 +961,14 @@ fn into_std_stream(stream: crate::ipc::LocalStream) -> io::Result<std::os::unix:
 struct Credential {
     record: RemoteBootstrapRecord,
     candidates: Vec<SocketAddr>,
-    /// Connection generation this dial presents.
-    generation: u64,
-    /// The logical client the token was minted for. A daemon restart changes
-    /// this process's id, so a cached credential has to carry the id it was
-    /// issued under or the server refuses it as a different client.
-    logical_client_id: [u8; REMOTE_QUIC_ID_BYTES],
 }
 
 #[derive(Serialize, Deserialize)]
 struct CachedCredential {
     record: RemoteBootstrapRecord,
     candidates: Vec<SocketAddr>,
-    /// Generation the next dial will present. Monotonic per credential, so the
-    /// server fences the older connection out when a redial replaces it.
-    next_connection_generation: u64,
     /// Set once a dial with this credential reached a live session.
     proven: bool,
-    #[serde(default)]
-    logical_client_id: Option<[u8; REMOTE_QUIC_ID_BYTES]>,
 }
 
 /// Keyed by target and session, which is exactly what the token is scoped to.
@@ -998,15 +981,12 @@ struct StoredCredential {
     session: String,
     record: StoredRecord,
     candidates: Vec<SocketAddr>,
-    next_connection_generation: u64,
     proven: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    logical_client_id: Option<String>,
 }
 
-/// The credential as it is written to disk: every fixed-size field is base64
-/// rather than a list of decimal bytes, so one credential stays readable on a
-/// handful of lines. The wire form keeps its arrays; only this file changes.
+/// One enrolled server as it is written to disk: the port it listens on and the
+/// certificate fingerprint to pin. Authorization is the device certificate, so
+/// this file holds no secret; copying it to another machine grants nothing.
 ///
 /// `server_instance_id` is absent on purpose: the server derives it from the
 /// same certificate the fingerprint hashes, so it is that hash's first bytes
@@ -1016,8 +996,6 @@ struct StoredRecord {
     schema_version: u32,
     port: u16,
     certificate_fingerprint: String,
-    capability_token: String,
-    expires_unix_seconds: u64,
 }
 
 impl StoredRecord {
@@ -1026,16 +1004,12 @@ impl StoredRecord {
             schema_version: record.schema_version,
             port: record.port,
             certificate_fingerprint: base64_encode(&record.certificate_fingerprint),
-            capability_token: base64_encode(&record.capability_token),
-            expires_unix_seconds: record.expires_unix_seconds,
         }
     }
 
     fn decode(&self) -> Option<RemoteBootstrapRecord> {
         let certificate_fingerprint: [u8; crate::protocol::REMOTE_QUIC_HASH_BYTES] =
             base64_decode(&self.certificate_fingerprint)?.try_into().ok()?;
-        let capability_token: [u8; crate::protocol::REMOTE_QUIC_TOKEN_BYTES] =
-            base64_decode(&self.capability_token)?.try_into().ok()?;
         let mut server_instance_id = [0u8; crate::protocol::REMOTE_QUIC_ID_BYTES];
         server_instance_id
             .copy_from_slice(&certificate_fingerprint[..crate::protocol::REMOTE_QUIC_ID_BYTES]);
@@ -1044,8 +1018,6 @@ impl StoredRecord {
             server_instance_id,
             port: self.port,
             certificate_fingerprint,
-            capability_token,
-            expires_unix_seconds: self.expires_unix_seconds,
         })
     }
 }
@@ -1104,12 +1076,7 @@ fn load_credential_cache() -> CredentialCache {
                 CachedCredential {
                     record,
                     candidates: entry.candidates,
-                    next_connection_generation: entry.next_connection_generation,
                     proven: entry.proven,
-                    logical_client_id: entry
-                        .logical_client_id
-                        .as_deref()
-                        .and_then(decode_logical_client_id),
                 },
             ))
         })
@@ -1128,11 +1095,7 @@ fn save_credential_cache(cache: &CredentialCache) -> io::Result<()> {
             session: session.clone(),
             record: StoredRecord::encode(&entry.record),
             candidates: entry.candidates.clone(),
-            next_connection_generation: entry.next_connection_generation,
             proven: entry.proven,
-            logical_client_id: entry
-                .logical_client_id
-                .map(|id| format_logical_client_id(&id)),
         })
         .collect::<Vec<_>>();
     let mut bytes = serde_json::to_vec_pretty(&entries).map_err(io::Error::other)?;
@@ -1165,54 +1128,20 @@ fn credential_key(config: &QuicBridgeConfig) -> CredentialKey {
     (config.target.clone(), config.session.clone())
 }
 
-/// Hand out the cached credential for `key`, reserving the next connection
-/// generation. An expired credential is evicted instead: the server would
-/// refuse it, and refusals cost a round trip on both ends.
-///
-/// The dial presents the logical client id the credential was minted under, not
-/// this process's own: the server binds a token to one client, so a daemon that
-/// restarted with a fresh id would be refused and forced to bootstrap again.
-fn reserve_cached_credential(
-    key: &CredentialKey,
-    now_unix: u64,
-    process_logical_client_id: [u8; REMOTE_QUIC_ID_BYTES],
-) -> Option<Credential> {
+fn cached_credential(key: &CredentialKey) -> Option<Credential> {
     update_credential_cache(|cache| {
-        let entry = cache.get_mut(key)?;
-        if entry.record.expires_unix_seconds
-            <= now_unix.saturating_add(CREDENTIAL_EXPIRY_SLACK.as_secs())
-            && !device_can_renew()
-        {
-            cache.remove(key);
-            return None;
-        }
-        let generation = entry.next_connection_generation;
-        entry.next_connection_generation = generation.saturating_add(1);
+        let entry = cache.get(key)?;
         Some(Credential {
             record: entry.record.clone(),
             candidates: entry.candidates.clone(),
-            generation,
-            logical_client_id: entry.logical_client_id.unwrap_or(process_logical_client_id),
         })
     })
-}
-
-/// An expired credential is still worth dialing when this machine enrolled a
-/// device: the server renews it on the strength of the device certificate
-/// instead of demanding another SSH bootstrap. Without an enrollment the local
-/// expiry stays authoritative, so a stale credential cannot be retried forever.
-///
-/// Checked per call rather than cached for the process: a daemon that started
-/// before the machine enrolled must notice the enrollment without a restart.
-fn device_can_renew() -> bool {
-    crate::remote::device::DeviceIdentity::load(&crate::remote::device::client_key_path()).is_some()
 }
 
 fn store_credential(
     key: CredentialKey,
     record: RemoteBootstrapRecord,
     candidates: Vec<SocketAddr>,
-    logical_client_id: [u8; REMOTE_QUIC_ID_BYTES],
 ) {
     update_credential_cache(|cache| {
         cache.insert(
@@ -1220,9 +1149,7 @@ fn store_credential(
             CachedCredential {
                 record,
                 candidates,
-                next_connection_generation: 1,
                 proven: false,
-                logical_client_id: Some(logical_client_id),
             },
         );
     });
@@ -1252,12 +1179,7 @@ pub(super) fn seed_credential_for_test(
     record: RemoteBootstrapRecord,
     candidates: Vec<SocketAddr>,
 ) {
-    store_credential(
-        credential_key(config),
-        record,
-        candidates,
-        config.logical_client_id,
-    );
+    store_credential(credential_key(config), record, candidates);
 }
 
 #[cfg(test)]
@@ -1269,14 +1191,12 @@ pub(super) fn forget_credential_for_test(config: &QuicBridgeConfig) {
 /// has none. The SSH round trip runs outside the lock so a slow bootstrap
 /// cannot stall another local connection.
 fn credential(config: &QuicBridgeConfig, key: &CredentialKey) -> Result<Credential, String> {
-    if let Some(credential) =
-        reserve_cached_credential(key, now_unix(), config.logical_client_id)
-    {
+    if let Some(credential) = cached_credential(key) {
         return Ok(credential);
     }
     bootstrap_credential(config, key)?;
-    reserve_cached_credential(key, now_unix(), config.logical_client_id)
-        .ok_or_else(|| "remote QUIC credential expired on arrival".to_owned())
+    cached_credential(key)
+        .ok_or_else(|| "remote QUIC bootstrap stored no connection information".to_owned())
 }
 
 /// Mint a credential over the authenticated SSH path and cache it.
@@ -1297,7 +1217,7 @@ fn bootstrap_credential(config: &QuicBridgeConfig, key: &CredentialKey) -> Resul
     }
     let candidates =
         remote_quic_candidates(&hostname, record.port).map_err(|err| err.to_string())?;
-    store_credential(key.clone(), record, candidates, config.logical_client_id);
+    store_credential(key.clone(), record, candidates);
     Ok(())
 }
 
@@ -1325,13 +1245,6 @@ fn rebootstrap(
     }
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or(0)
-}
-
 /// Milliseconds since this process started, so a cold-start log line says how
 /// much of the delay belongs to the bridge rather than to the dial.
 fn process_uptime_ms() -> u64 {
@@ -1352,19 +1265,15 @@ pub(crate) fn mark_process_start() {
 // SSH bootstrap
 // ---------------------------------------------------------------------------
 
-/// `herdr [--session S] remote-quic-bootstrap <client id> [certificate-hex]`
-/// on the remote host. The certificate argument enrolls this device so later
-/// connections can authenticate without SSH.
+/// `herdr [--session S] remote-quic-bootstrap [certificate-hex]` on the remote
+/// host. The certificate argument enrolls this device so later connections can
+/// authenticate without SSH.
 fn remote_quic_bootstrap_command(
     remote_herdr: &RemoteHerdr,
     session: &str,
-    logical_client_id: &[u8; REMOTE_QUIC_ID_BYTES],
     certificate: Option<&str>,
 ) -> String {
-    let mut args = format!(
-        "remote-quic-bootstrap {}",
-        format_logical_client_id(logical_client_id)
-    );
+    let mut args = "remote-quic-bootstrap".to_owned();
     if let Some(certificate) = certificate {
         args.push(' ');
         args.push_str(certificate);
@@ -1388,28 +1297,6 @@ fn device_label_assignment() -> String {
     format!("{DEVICE_LABEL_ENV_VAR}={}", super::shell_quote(&label))
 }
 
-fn format_logical_client_id(value: &[u8; REMOTE_QUIC_ID_BYTES]) -> String {
-    use std::fmt::Write as _;
-    let mut encoded = String::with_capacity(REMOTE_QUIC_ID_BYTES * 2);
-    for byte in value {
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
-}
-
-/// The inverse of [`format_logical_client_id`], which is also the encoding the
-/// remote bootstrap accepts on its command line.
-fn decode_logical_client_id(value: &str) -> Option<[u8; REMOTE_QUIC_ID_BYTES]> {
-    if value.len() != REMOTE_QUIC_ID_BYTES * 2 {
-        return None;
-    }
-    let mut id = [0u8; REMOTE_QUIC_ID_BYTES];
-    for (index, byte) in id.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
-    }
-    Some(id)
-}
-
 /// Ask the remote server for a QUIC credential over SSH. A stock server has no
 /// such subcommand and fails, which is how a fork client learns to stay on SSH.
 /// The token is never logged.
@@ -1430,7 +1317,6 @@ fn request_remote_quic_bootstrap(config: &QuicBridgeConfig) -> io::Result<Remote
         .arg(remote_quic_bootstrap_command(
             &config.remote_herdr,
             &config.session,
-            &config.logical_client_id,
             certificate.as_deref(),
         ))
         .stdout(Stdio::piped())
@@ -1527,9 +1413,9 @@ fn remote_quic_candidates(hostname: &str, port: u16) -> io::Result<Vec<SocketAdd
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{read_message, REMOTE_QUIC_HASH_BYTES, REMOTE_QUIC_TOKEN_BYTES};
+    use crate::protocol::{read_message, REMOTE_QUIC_HASH_BYTES};
 
-    fn record(expires_unix_seconds: u64) -> RemoteBootstrapRecord {
+    fn record() -> RemoteBootstrapRecord {
         // The server derives both from one certificate hash, so the fixture
         // must too: a fingerprint and an instance id that disagree would pass
         // here and fail against a real server.
@@ -1541,8 +1427,6 @@ mod tests {
             server_instance_id,
             port: 48_001,
             certificate_fingerprint,
-            capability_token: [3; REMOTE_QUIC_TOKEN_BYTES],
-            expires_unix_seconds,
         }
     }
 
@@ -1550,17 +1434,12 @@ mod tests {
         ("fedora".to_owned(), "default".to_owned())
     }
 
-    /// The logical client id a test's process would present. Fixtures use one
-    /// value so a stored credential and a dial agree unless a test says
-    /// otherwise.
-    const TEST_CLIENT_ID: [u8; REMOTE_QUIC_ID_BYTES] = [0x7E; REMOTE_QUIC_ID_BYTES];
-
     fn store(key: CredentialKey, record: RemoteBootstrapRecord, candidates: Vec<SocketAddr>) {
-        store_credential(key, record, candidates, TEST_CLIENT_ID);
+        store_credential(key, record, candidates);
     }
 
-    fn reserve(key: &CredentialKey, now_unix: u64) -> Option<Credential> {
-        reserve_cached_credential(key, now_unix, TEST_CLIENT_ID)
+    fn cached(key: &CredentialKey) -> Option<Credential> {
+        cached_credential(key)
     }
 
     /// Points both XDG roots at a throwaway directory for the duration of one
@@ -1607,7 +1486,7 @@ mod tests {
     #[test]
     fn the_bootstrap_command_puts_the_label_before_the_executable() {
         let remote = RemoteHerdr::for_test_binary(std::path::Path::new("/nonexistent/herdr"));
-        let command = remote_quic_bootstrap_command(&remote, "default", &[0xab; 16], Some("cafe"));
+        let command = remote_quic_bootstrap_command(&remote, "default", Some("cafe"));
         let assignment = format!("{}=", crate::remote::host::DEVICE_LABEL_ENV_VAR);
         let prefix = command
             .find(&assignment)
@@ -1630,7 +1509,7 @@ mod tests {
     #[test]
     fn the_bootstrap_command_omits_the_label_when_not_enrolling() {
         let remote = RemoteHerdr::for_test_binary(std::path::Path::new("/nonexistent/herdr"));
-        let command = remote_quic_bootstrap_command(&remote, "default", &[0xab; 16], None);
+        let command = remote_quic_bootstrap_command(&remote, "default", None);
         assert!(
             !command.contains(crate::remote::host::DEVICE_LABEL_ENV_VAR),
             "a plain credential request needs no label: {command}"
@@ -1654,14 +1533,13 @@ mod tests {
 
         store(
             key(),
-            record(9_999),
+            record(),
             vec![SocketAddr::from(([127, 0, 0, 1], 48_000))],
         );
 
         let reloaded = load_credential_cache();
         let entry = reloaded.get(&key()).expect("credential reloaded");
         assert_eq!(entry.record.port, 48_001);
-        assert_eq!(entry.next_connection_generation, 1);
         assert_eq!(entry.candidates.len(), 1);
     }
 
@@ -1669,10 +1547,10 @@ mod tests {
     fn hosts_json_is_pretty_printed_with_one_entry_per_target() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("ndjson");
-        store(key(), record(9_999), Vec::new());
+        store(key(), record(), Vec::new());
         store(
             ("phone".to_owned(), "default".to_owned()),
-            record(9_999),
+            record(),
             Vec::new(),
         );
 
@@ -1686,13 +1564,13 @@ mod tests {
     fn a_credential_is_written_as_base64_over_a_handful_of_lines() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("base64");
-        store(key(), record(9_999), Vec::new());
+        store(key(), record(), Vec::new());
 
         let text = std::fs::read_to_string(hosts_path()).unwrap();
         assert!(
             text.contains(&format!(
                 "\"certificate_fingerprint\": \"{}\"",
-                base64_encode(&record(9_999).certificate_fingerprint)
+                base64_encode(&record().certificate_fingerprint)
             )),
             "a fingerprint is one base64 string, not a list of decimal bytes:\n{text}"
         );
@@ -1710,7 +1588,7 @@ mod tests {
     fn a_stored_credential_decodes_back_to_the_record_it_was_written_from() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("roundtrip-record");
-        let original = record(9_999);
+        let original = record();
         let encoded = StoredRecord::encode(&original);
         let decoded = encoded.decode().expect("decodes");
         assert_eq!(decoded, original, "base64 must preserve every field");
@@ -1732,8 +1610,8 @@ mod tests {
         // re-read under the lock instead of replaying its own snapshot.
         let apfel = ("apfel".to_owned(), "default".to_owned());
         let debian = ("debian".to_owned(), "default".to_owned());
-        store(apfel.clone(), record(9_999), Vec::new());
-        store(debian.clone(), record(9_999), Vec::new());
+        store(apfel.clone(), record(), Vec::new());
+        store(debian.clone(), record(), Vec::new());
         drop_credential(&apfel);
 
         let remaining = load_credential_cache();
@@ -1746,10 +1624,10 @@ mod tests {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("proven");
         let other = ("debian".to_owned(), "default".to_owned());
-        store(key(), record(9_999), Vec::new());
+        store(key(), record(), Vec::new());
         mark_credential_proven(&key());
         // A second daemon writing its own row must not reset the first's flag.
-        store(other.clone(), record(9_999), Vec::new());
+        store(other.clone(), record(), Vec::new());
 
         let cache = load_credential_cache();
         assert!(cache.get(&key()).expect("first entry").proven);
@@ -1777,44 +1655,13 @@ mod tests {
     }
 
     #[test]
-    fn reserving_bumps_the_generation_so_the_server_fences_the_old_dial() {
+    fn a_stored_record_dials_without_any_expiry() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let _dir = StateDir::new("generation");
-        store(key(), record(9_999), Vec::new());
-        let first = reserve(&key(), 1).expect("first dial");
-        let second = reserve(&key(), 1).expect("second dial");
-        assert_eq!(first.generation, 1);
-        assert_eq!(second.generation, 2);
-    }
+        let _dir = StateDir::new("no-expiry");
+        store(key(), record(), Vec::new());
 
-    #[test]
-    fn an_expired_credential_is_evicted_and_a_live_one_is_usable() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let _dir = StateDir::new("expiry");
-        let expires = 10_000;
-        let slack = CREDENTIAL_EXPIRY_SLACK.as_secs();
-
-        store(key(), record(expires), Vec::new());
-        assert!(
-            reserve(&key(), expires + slack).is_none(),
-            "without an enrolled device the local expiry stays authoritative"
-        );
-        assert!(load_credential_cache().is_empty(), "the expired entry is evicted");
-
-        // One second outside the slack window: `expires - now` must exceed it.
-        store(key(), record(expires), Vec::new());
-        assert!(
-            reserve(&key(), expires - slack - 1).is_some(),
-            "a credential inside its lifetime is usable"
-        );
-    }
-
-    #[test]
-    fn a_future_expiry_is_always_reserved() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let _dir = StateDir::new("future");
-        store(key(), record(u64::MAX), Vec::new());
-        assert!(reserve(&key(), now_unix()).is_some());
+        let reserved = cached(&key()).expect("a stored record still dials");
+        assert_eq!(reserved.record.port, 48_001);
     }
 
     /// End to end over the real machinery: `ssh localhost` runs this build's
@@ -2016,7 +1863,7 @@ mod tests {
             next_step(
                 &mut state,
                 LadderEvent::ConnectFailed(ConnectError::Rejected(SessionExit::Rebootstrap(
-                    "unknown capability".to_owned()
+                    "unknown device".to_owned()
                 )))
             ),
             LadderStep::Rebootstrap
@@ -2033,10 +1880,10 @@ mod tests {
             next_step(
                 &mut state,
                 LadderEvent::ConnectFailed(ConnectError::Rejected(SessionExit::Rebootstrap(
-                    "unknown capability".to_owned()
+                    "unknown device".to_owned()
                 )))
             ),
-            LadderStep::SshFallback("unknown capability".to_owned())
+            LadderStep::SshFallback("unknown device".to_owned())
         );
     }
 
@@ -2144,70 +1991,25 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_credential_carries_the_client_id_it_was_minted_under() {
+    fn hosts_json_names_no_client_state() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("client-id");
+        store(key(), record(), Vec::new());
 
-        // Two daemons in a row: the second is a new process and so has a new
-        // logical client id. The cached credential still names the first, and
-        // the server binds a token to exactly one client, so a dial that
-        // presented the second id would be refused and forced to bootstrap --
-        // paying SSH every time a daemon restarts.
-        let first_process_id = [0xAA; REMOTE_QUIC_ID_BYTES];
-        let second_process_id = [0xBB; REMOTE_QUIC_ID_BYTES];
-
-        store_credential(
-            key(),
-            record(9_999),
-            Vec::new(),
-            first_process_id,
-        );
-
-        let reserved = reserve_cached_credential(&key(), 1, second_process_id)
-            .expect("a fresh credential is reserved");
-        assert_eq!(
-            reserved.logical_client_id, first_process_id,
-            "the dial must present the id the token was minted for"
-        );
-
-        // A credential with no recorded id (written by a build that predates
-        // the field) falls back to this process's id rather than dropping the
-        // whole entry.
-        update_credential_cache(|cache| {
-            cache.get_mut(&key()).expect("entry").logical_client_id = None;
-        });
-        let reserved = reserve_cached_credential(&key(), 1, second_process_id)
-            .expect("an id-less credential is still usable");
-        assert_eq!(reserved.logical_client_id, second_process_id);
-    }
-
-    #[test]
-    fn the_logical_client_id_survives_a_reload() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let _dir = StateDir::new("client-id-reload");
-        let minted = [0x5A; REMOTE_QUIC_ID_BYTES];
-        store_credential(key(), record(9_999), Vec::new(), minted);
-
-        let reloaded = load_credential_cache();
-        assert_eq!(
-            reloaded.get(&key()).expect("entry").logical_client_id,
-            Some(minted),
-            "the id is persisted, so a restarted daemon still matches its token"
-        );
+        let text = std::fs::read_to_string(hosts_path()).unwrap();
+        for forbidden in ["logical_client_id", "generation"] {
+            assert!(
+                !text.contains(forbidden),
+                "a host entry describes the server only, never the client: {text}"
+            );
+        }
     }
 
     #[test]
     fn a_credential_hit_never_reaches_ssh() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _dir = StateDir::new("no-ssh");
-        // Far enough ahead that the expiry branch cannot answer: this test is
-        // about the cache lookup, not about lifetime.
-        store_credential(
-            key(),
-            record(u64::MAX),
-            Vec::new(),
-            [0x11; REMOTE_QUIC_ID_BYTES],
-        );
+        store(key(), record(), Vec::new());
 
         // No server is running and no SSH target exists, so any attempt to
         // bootstrap would fail rather than silently succeed. Reaching the
@@ -2223,39 +2025,7 @@ mod tests {
         };
         let reserved = credential(&config, &key())
             .expect("a cached credential must not need SSH");
-        assert_eq!(
-            reserved.logical_client_id, [0x11; REMOTE_QUIC_ID_BYTES],
-            "the reserved credential is the cached one"
-        );
-        assert_eq!(reserved.generation, 1);
-    }
-
-    #[test]
-    fn a_cached_credential_fences_each_dial_with_a_newer_generation() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let _dir = StateDir::new("fence");
-        store(key(), record(10_000), Vec::new());
-
-        let first = reserve(&key(), 1_000).expect("cached");
-        let second = reserve(&key(), 1_000).expect("cached");
-        assert_eq!(first.generation, 1);
-        assert_eq!(second.generation, 2);
-        assert_eq!(second.record.capability_token, record(0).capability_token);
-    }
-
-    #[test]
-    fn an_expired_credential_is_evicted_instead_of_dialed() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let _dir = StateDir::new("spent");
-        let expires_at = 10_000;
-        store(key(), record(expires_at), Vec::new());
-
-        // Inside the expiry slack the server would refuse the dial, so the
-        // credential is already spent.
-        let too_late = expires_at - CREDENTIAL_EXPIRY_SLACK.as_secs();
-        assert!(reserve(&key(), too_late).is_none());
-        assert!(load_credential_cache().is_empty(), "an expired credential must be evicted");
-        assert!(reserve(&key(), 0).is_none());
+        assert_eq!(reserved.record.port, 48_001);
     }
 
     #[tokio::test]
@@ -2297,6 +2067,15 @@ mod tests {
         use crate::server::remote_quic::RemoteQuicServer;
         use std::net::{Ipv4Addr, UdpSocket};
 
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _state_root = StateDir::new("mux-live");
+        let device = crate::remote::device::DeviceIdentity::load_or_create(
+            &crate::remote::device::client_key_path(),
+        )
+        .expect("create the device identity the dial presents");
+        crate::remote::device::enroll(&device.certificate_der(), "mux", "mux-test")
+            .expect("enroll the device the dial presents");
+
         let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind port probe");
         let port = probe.local_addr().expect("probe address").port();
         drop(probe);
@@ -2314,7 +2093,6 @@ mod tests {
         let record = server
             .bootstrap(&crate::protocol::RemoteBootstrapRequest {
                 session: "mux-test".to_owned(),
-                logical_client_id: [5; REMOTE_QUIC_ID_BYTES],
             })
             .expect("mint capability");
 
@@ -2465,18 +2243,6 @@ mod tests {
         if let (Some(first_ipv4), Some(last_ipv6)) = (first_ipv4, last_ipv6) {
             assert!(last_ipv6 < first_ipv4, "IPv6 candidates must come first");
         }
-    }
-
-    #[test]
-    fn the_logical_client_id_is_lowercase_hex() {
-        // The remote side parses this back with `from_str_radix`, so the
-        // encoding is part of the bootstrap contract.
-        let mut id = [0u8; REMOTE_QUIC_ID_BYTES];
-        id[0] = 0x0a;
-        id[REMOTE_QUIC_ID_BYTES - 1] = 0xff;
-        let encoded = format_logical_client_id(&id);
-        assert_eq!(encoded.len(), REMOTE_QUIC_ID_BYTES * 2);
-        assert_eq!(encoded, "0a0000000000000000000000000000ff");
     }
 
     #[test]

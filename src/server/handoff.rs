@@ -51,9 +51,10 @@ pub(crate) struct HandoffManifest {
     #[serde(default)]
     pub host_shutdown_intent: Option<crate::platform::HostShutdownIntent>,
     /// Live QUIC transport state. Carrying it means remote clients reconnect
-    /// to the successor with the capability they already hold instead of
-    /// running a fresh SSH bootstrap. Absent from manifests written before
-    /// this field existed and from servers that never bound a QUIC endpoint.
+    /// to the successor with the device certificate they already enrolled
+    /// instead of running a fresh SSH bootstrap. Absent from manifests written
+    /// before this field existed and from servers that never bound a QUIC
+    /// endpoint.
     #[serde(default)]
     pub remote_quic: Option<crate::server::remote_quic::RemoteQuicHandoffState>,
 }
@@ -580,14 +581,6 @@ mod tests {
             certificate_fingerprint: [9u8; crate::protocol::REMOTE_QUIC_HASH_BYTES],
             port: 48123,
             socket_fd_count: 2,
-            tokens: vec![crate::server::remote_quic::HandoffToken {
-                token_hash: [3u8; crate::protocol::REMOTE_QUIC_HASH_BYTES],
-                session: "default".to_owned(),
-                logical_client_id: [4u8; crate::protocol::REMOTE_QUIC_ID_BYTES],
-                expires_unix_seconds: 1_700_000_000,
-                connection_generation: 5,
-                issued_order: 11,
-            }],
         }
     }
 
@@ -636,21 +629,6 @@ mod tests {
         );
         assert_eq!(restored.port, expected.port);
         assert_eq!(restored.socket_fd_count, expected.socket_fd_count);
-        assert_eq!(restored.tokens.len(), 1);
-        let token = &restored.tokens[0];
-        let expected_token = &expected.tokens[0];
-        assert_eq!(token.token_hash, expected_token.token_hash);
-        assert_eq!(token.session, expected_token.session);
-        assert_eq!(token.logical_client_id, expected_token.logical_client_id);
-        assert_eq!(
-            token.expires_unix_seconds,
-            expected_token.expires_unix_seconds
-        );
-        assert_eq!(
-            token.connection_generation,
-            expected_token.connection_generation
-        );
-        assert_eq!(token.issued_order, expected_token.issued_order);
     }
 
     #[test]

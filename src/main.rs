@@ -407,9 +407,6 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # transport = "auto"
 # Inclusive UDP range for the lazy, per-server-process QUIC listener.
 # quic_port_range = "48000-48100"
-# How long an SSH-minted QUIC credential stays valid for fresh reconnects
-# without re-running SSH.
-# quic_idle_timeout_seconds = 86400
 # How long a silent QUIC connection is kept before the server declares it
 # dead (10-600).
 # quic_transport_idle_timeout_seconds = 180

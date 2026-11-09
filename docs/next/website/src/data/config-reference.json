@@ -1483,12 +1483,6 @@
           "description": "Inclusive unprivileged UDP port range the remote server binds for its lazily started QUIC listener."
         },
         {
-          "key": "remote.quic_idle_timeout_seconds",
-          "type": "integer",
-          "default": "86400",
-          "description": "How long an SSH-minted QUIC credential stays valid for fresh reconnects without re-running SSH."
-        },
-        {
           "key": "remote.quic_transport_idle_timeout_seconds",
           "type": "integer",
           "default": "180",

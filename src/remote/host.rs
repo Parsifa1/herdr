@@ -41,34 +41,34 @@ pub(crate) fn run_remote_client_bridge(args: &[String]) -> io::Result<()> {
     crate::platform::forward_remote_bridge_stdio(stream, idle_timeout)
 }
 
-/// `herdr remote-quic-bootstrap <client-id> [certificate-hex]`: ask the local
-/// server for a QUIC credential on behalf of the SSH-authenticated caller and
-/// print it as JSON. The caller's SSH session is the authentication; this
-/// helper only relays. A certificate argument enrolls that device, which is
-/// what lets it reconnect later without SSH.
+/// `herdr remote-quic-bootstrap [certificate-hex]`: ask the local server for a
+/// QUIC credential on behalf of the SSH-authenticated caller and print it as
+/// JSON. The caller's SSH session is the authentication; this helper only
+/// relays. A certificate argument enrolls that device, which is what lets it
+/// reconnect later without SSH.
 #[cfg(unix)]
 pub(crate) fn run_remote_quic_bootstrap(args: &[String]) -> io::Result<()> {
-    let (logical_client_id, certificate) = match args {
-        [id] => (id.as_str(), None),
-        [id, certificate] => (
-            id.as_str(),
-            Some(
-                super::device::decode_hex(certificate)
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?,
-            ),
+    let certificate = match args {
+        [] => None,
+        [certificate] => Some(
+            super::device::decode_hex(certificate)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?,
         ),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: remote-quic-bootstrap <client-id> [certificate-hex]",
+                "usage: remote-quic-bootstrap [certificate-hex]",
             ))
         }
     };
-    let logical_client_id = parse_logical_client_id(logical_client_id)?;
     ensure_remote_server_running()?;
+    // The SSH session that ran this helper also names the session the caller
+    // may attach to, so the enrollment is scoped to it.
+    let session = crate::session::active_name()
+        .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned());
     if let Some(certificate) = certificate {
         let name = device_label();
-        match super::device::enroll(&certificate, &name) {
+        match super::device::enroll(&certificate, &name, &session) {
             Ok(true) => tracing::info!(device = %name, "remote QUIC device enrolled"),
             Ok(false) => {}
             Err(err) => {
@@ -88,13 +88,10 @@ pub(crate) fn run_remote_quic_bootstrap(args: &[String]) -> io::Result<()> {
             ),
         )
     })?;
-    let session = crate::session::active_name()
-        .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned());
     crate::protocol::write_message(
         &mut stream,
         &crate::protocol::ClientMessage::RemoteBootstrap(crate::protocol::RemoteBootstrapRequest {
             session,
-            logical_client_id,
         }),
     )
     .map_err(|err| io::Error::other(err.to_string()))?;
@@ -132,27 +129,6 @@ fn device_label() -> String {
         })
 }
 
-#[cfg(unix)]
-fn parse_logical_client_id(value: &str) -> io::Result<[u8; crate::protocol::REMOTE_QUIC_ID_BYTES]> {
-    if value.len() != crate::protocol::REMOTE_QUIC_ID_BYTES * 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "logical client id must contain 32 hexadecimal characters",
-        ));
-    }
-    let mut bytes = [0u8; crate::protocol::REMOTE_QUIC_ID_BYTES];
-    for (index, output) in bytes.iter_mut().enumerate() {
-        let offset = index * 2;
-        *output = u8::from_str_radix(&value[offset..offset + 2], 16).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "logical client id contains non-hexadecimal characters",
-            )
-        })?;
-    }
-    Ok(bytes)
-}
-
 fn ensure_remote_server_running() -> io::Result<()> {
     let socket_path = crate::server::socket_paths::client_socket_path();
     if crate::server::autodetect::is_server_listening()? {
@@ -176,23 +152,4 @@ fn ensure_remote_server_running() -> io::Result<()> {
 
     crate::server::autodetect::spawn_server_daemon()?;
     crate::server::autodetect::wait_for_server_socket(&socket_path, Duration::from_secs(5))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_logical_client_id;
-
-    #[test]
-    fn logical_client_id_parses_exactly_32_hex_digits() {
-        assert_eq!(
-            parse_logical_client_id("00ff00ff00ff00ff00ff00ff00ff00ff").unwrap(),
-            [
-                0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff,
-                0x00, 0xff
-            ]
-        );
-        assert!(parse_logical_client_id("00ff").is_err());
-        assert!(parse_logical_client_id("zz").is_err());
-        assert!(parse_logical_client_id("0g000000000000000000000000000000").is_err());
-    }
 }

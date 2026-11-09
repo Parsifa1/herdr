@@ -99,8 +99,25 @@ pub(crate) fn remote_private_temp_base() -> PathBuf {
     std::env::temp_dir()
 }
 
-pub(crate) fn remote_bridge_endpoint_path(readable_name: &str, _short_name: &str) -> PathBuf {
-    std::env::temp_dir().join(readable_name)
+pub(crate) fn remote_bridge_socket_dir() -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join("herdr-run");
+    match create_remote_private_dir(&dir) {
+        Ok(()) => Ok(dir),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(dir),
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn remote_bridge_endpoint_path(
+    dir: &std::path::Path,
+    readable_name: &str,
+    short_name: &str,
+) -> std::io::Result<PathBuf> {
+    let readable = dir.join(readable_name);
+    if readable.as_os_str().len() <= 100 {
+        return Ok(readable);
+    }
+    Ok(dir.join(short_name))
 }
 
 pub(crate) fn remote_reattach_program(program: &str) -> String {

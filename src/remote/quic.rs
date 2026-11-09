@@ -372,9 +372,9 @@ pub(crate) enum SessionExit {
     Retry(String),
     /// The credential is unusable; a fresh SSH bootstrap is required.
     Rebootstrap(String),
-    /// A newer generation of this capability was accepted: another client has
-    /// taken the session over. Terminal — reconnecting would fence the client
-    /// that just won, which would fence this one straight back.
+    /// A newer generation of this client slot was accepted: another connection
+    /// has taken the session over. Terminal — reconnecting would fence the
+    /// connection that just won, which would fence this one straight back.
     Superseded,
     /// This side closed the connection deliberately. Nothing to reconnect to.
     Shutdown(String),
@@ -676,7 +676,6 @@ async fn handshake(
             )))
         }
     };
-    let generation = hello.connection_generation;
     if let Err(error) = write_async_message(&mut send, &hello, MAX_FRAME_SIZE).await {
         return Err(classify_handshake_failure(
             &connection,
@@ -707,12 +706,6 @@ async fn handshake(
             "remote QUIC schema {} does not match local schema {REMOTE_QUIC_SCHEMA_VERSION}",
             accepted.schema_version
         ))));
-    }
-    if accepted.connection_generation != generation {
-        return Err(ConnectError::Other(format!(
-            "{candidate}: remote QUIC accepted generation {} instead of {generation}",
-            accepted.connection_generation
-        )));
     }
     let remote_ip = connection.remote_address().ip();
     Ok((
@@ -883,8 +876,9 @@ fn client_config(fingerprint: [u8; REMOTE_QUIC_HASH_BYTES]) -> Result<quinn::Cli
     Ok(config)
 }
 
-/// The enrolled device's credentials, or nothing when this machine has not
-/// enrolled: the capability token still authorizes that connection.
+/// The device certificate this machine enrolled, if it has one. The server
+/// requires it, so a machine without a certificate cannot complete the
+/// handshake and falls back to SSH.
 fn device_client_credentials() -> Option<(Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>)> {
     let path = crate::remote::device::client_key_path();
     let identity = crate::remote::device::DeviceIdentity::load(&path)?;
@@ -976,7 +970,7 @@ fn wildcard_for(remote_ip: IpAddr) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{REMOTE_QUIC_ID_BYTES, REMOTE_QUIC_TOKEN_BYTES};
+    use crate::protocol::REMOTE_QUIC_ID_BYTES;
     use rustls::client::danger::ServerCertVerifier as _;
     use tokio::sync::mpsc;
 
@@ -1322,13 +1316,11 @@ mod tests {
         );
     }
 
-    fn test_hello(generation: u64) -> RemoteQuicHello {
+    fn test_hello() -> RemoteQuicHello {
         RemoteQuicHello {
             schema_version: REMOTE_QUIC_SCHEMA_VERSION,
             server_instance_id: [5u8; REMOTE_QUIC_ID_BYTES],
             logical_client_id: [6u8; REMOTE_QUIC_ID_BYTES],
-            capability_token: [7u8; REMOTE_QUIC_TOKEN_BYTES],
-            connection_generation: generation,
         }
     }
 
@@ -1390,13 +1382,11 @@ mod tests {
                     else {
                         return;
                     };
-                    let connection_generation = hello.connection_generation;
                     let _ = hello_tx.send(hello);
                     match verdict {
                         Verdict::Accept => {
                             let accepted = RemoteQuicAccepted {
                                 schema_version: REMOTE_QUIC_SCHEMA_VERSION,
-                                connection_generation,
                             };
                             let _ = write_async_message(&mut send, &accepted, MAX_FRAME_SIZE).await;
                             connection.closed().await;
@@ -1419,7 +1409,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pinned_dial_presents_the_hello_and_takes_the_acceptance() {
         let mut server = start_test_server(Verdict::Accept);
-        let hello = test_hello(9);
+        let hello = test_hello();
         let (session, _send, _recv) = QuicSession::connect(QuicClientParams {
             candidates: vec![server.address],
             fingerprint: server.fingerprint,
@@ -1445,7 +1435,7 @@ mod tests {
         let error = QuicSession::connect(QuicClientParams {
             candidates: vec![server.address],
             fingerprint: hash_bytes(b"some other server's certificate"),
-            hello: test_hello(1),
+            hello: test_hello(),
         })
         .await
         .expect_err("an unpinned certificate must not be accepted");
@@ -1462,15 +1452,15 @@ mod tests {
     /// message, so `connect` has to read the close code instead of reporting
     /// the stream error it sees first.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_refused_capability_asks_for_a_fresh_bootstrap() {
+    async fn a_refused_authentication_asks_for_a_fresh_bootstrap() {
         let server = start_test_server(Verdict::Reject(REMOTE_QUIC_CLOSE_AUTH));
         let error = QuicSession::connect(QuicClientParams {
             candidates: vec![server.address],
             fingerprint: server.fingerprint,
-            hello: test_hello(2),
+            hello: test_hello(),
         })
         .await
-        .expect_err("a refused capability cannot yield a session");
+        .expect_err("a refused authentication cannot yield a session");
         assert!(
             matches!(error, ConnectError::Rejected(SessionExit::Rebootstrap(_))),
             "an AUTH close must invalidate the cached credential: {error}"
@@ -1500,7 +1490,7 @@ mod tests {
             .block_on(QuicSession::connect(QuicClientParams {
                 candidates: candidates.clone(),
                 fingerprint: [9u8; REMOTE_QUIC_HASH_BYTES],
-                hello: test_hello(1),
+                hello: test_hello(),
             }))
             .expect_err("silent candidates cannot complete a handshake");
         let elapsed = started.elapsed();

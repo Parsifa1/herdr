@@ -295,13 +295,13 @@ fn assert_ok(response: serde_json::Value) {
 
 /// The QUIC authority a client pins: instance id, port, and certificate. A
 /// live handoff must keep all three so a remote client reconnects with the
-/// capability it already holds instead of re-running the SSH bootstrap.
+/// device certificate it already enrolled instead of re-running the SSH
+/// bootstrap. There is no capability: authorization is the certificate.
 #[derive(Debug, PartialEq, Eq)]
 struct BootstrapAuthority {
     server_instance_id: [u8; 16],
     port: u16,
     certificate_fingerprint: [u8; 32],
-    capability_token: [u8; 32],
 }
 
 /// Speaks the private `ClientMessage::RemoteBootstrap` handshake the SSH helper
@@ -313,12 +313,11 @@ fn remote_bootstrap(client_socket: &Path) -> Result<BootstrapAuthority, String> 
         .map_err(|err| err.to_string())?;
 
     // ClientMessage::RemoteBootstrap is variant 21; the request is a session
-    // name and a 16-byte logical client id.
+    // name. It carries nothing about the client, so the reply is one record.
     let session = "default";
     let mut payload = support::encode_varint_u32(CLIENT_MESSAGE_REMOTE_BOOTSTRAP);
     payload.extend_from_slice(&support::encode_varint_u32(session.len() as u32));
     payload.extend_from_slice(session.as_bytes());
-    payload.extend_from_slice(&[7u8; 16]);
     stream
         .write_all(&support::frame_message(&payload))
         .map_err(|err| err.to_string())?;
@@ -363,18 +362,11 @@ fn remote_bootstrap(client_socket: &Path) -> Result<BootstrapAuthority, String> 
         .ok_or("reply too short for certificate fingerprint")?
         .try_into()
         .map_err(|_| "fingerprint was not 32 bytes".to_owned())?;
-    offset += 32;
-    let capability_token: [u8; 32] = body
-        .get(offset..offset + 32)
-        .ok_or("reply too short for capability token")?
-        .try_into()
-        .map_err(|_| "capability token was not 32 bytes".to_owned())?;
 
     Ok(BootstrapAuthority {
         server_instance_id,
         port: u16::try_from(port).map_err(|_| "port did not fit in u16".to_owned())?,
         certificate_fingerprint,
-        capability_token,
     })
 }
 
@@ -415,10 +407,6 @@ fn live_handoff_keeps_the_quic_authority_remote_clients_pinned() {
     assert_eq!(
         after.port, before.port,
         "successor must keep serving the inherited UDP port"
-    );
-    assert_ne!(
-        after.capability_token, before.capability_token,
-        "each bootstrap should still mint a fresh capability"
     );
 
     let _ = request(

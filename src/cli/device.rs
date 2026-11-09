@@ -8,9 +8,10 @@ const HELP: &str = "Usage:
   herdr device list [--json]
   herdr device revoke <name>
 
-Devices enroll themselves once, through the SSH bootstrap that mints a QUIC
-credential: the first `herdr --remote <target>` from a machine adds it here.
-An enrolled device keeps connecting without SSH until it is revoked.
+Devices enroll themselves once, through the SSH bootstrap that starts a QUIC
+connection: the first `herdr --remote <target>` from a machine adds it here,
+scoped to the session that bootstrap ran under. An enrolled device keeps
+connecting without SSH, for those sessions, until it is revoked.
 Revoking takes effect on that device's next connection and cannot be undone
 by re-enrolling the same key.";
 
@@ -19,6 +20,7 @@ struct DeviceRow<'a> {
     name: &'a str,
     certificate_sha256: &'a str,
     enrolled_unix_seconds: u64,
+    sessions: &'a [String],
     revoked: bool,
 }
 
@@ -55,6 +57,7 @@ fn list(args: &[String]) -> std::io::Result<i32> {
                 name: &entry.name,
                 certificate_sha256: &entry.certificate_sha256,
                 enrolled_unix_seconds: entry.enrolled_unix_seconds,
+                sessions: &entry.sessions,
                 revoked: entry.revoked,
             })
             .collect::<Vec<_>>();
@@ -67,7 +70,14 @@ fn list(args: &[String]) -> std::io::Result<i32> {
     }
     for entry in &devices.devices {
         let state = if entry.revoked { "revoked" } else { "enabled" };
-        println!("{} {} {}", entry.name, state, entry.certificate_sha256);
+        // Entries written before names were sanitized can still carry control
+        // characters, and this output goes straight to a terminal.
+        let name = device::sanitize_device_name(&entry.name);
+        let sessions = entry.sessions.join(",");
+        println!(
+            "{} {} {} sessions={}",
+            name, state, entry.certificate_sha256, sessions
+        );
     }
     Ok(0)
 }

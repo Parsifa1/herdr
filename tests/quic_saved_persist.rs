@@ -29,9 +29,39 @@ fn unique_dir(_prefix: &str) -> PathBuf {
     PathBuf::from("/tmp").join(format!("hqp-{nonce:x}"))
 }
 
-fn crate_persisted_path(base: &Path) -> PathBuf {
+fn crate_persisted_path(state_home: &Path) -> PathBuf {
     let hash = persisted_socket_hash(PROFILE, TARGET, "default");
-    base.join(format!("herdr-qp-{PROFILE}-{hash}.sock"))
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    let dir = state_home.join(app_dir).join("run");
+    // The binary falls back to the hashed short name when the readable one
+    // exceeds sun_path, so the expectation has to make the same choice.
+    let readable = dir.join(format!("herdr-qp-{PROFILE}-{hash}.sock"));
+    if fits_socket_path(&readable) {
+        return readable;
+    }
+    let short = dir.join(format!("herdr-q-{}-{hash}.sock", &PROFILE[..16]));
+    if fits_socket_path(&short) {
+        return short;
+    }
+    std::env::temp_dir()
+        .join(format!("herdr-{}", current_uid()))
+        .join(format!("herdr-q-{}-{hash}.sock", &PROFILE[..16]))
+}
+
+fn current_uid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(std::env::temp_dir())
+        .expect("read the temp directory owner")
+        .uid()
+}
+
+fn fits_socket_path(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().len() <= 103
 }
 
 fn wait_for_file(path: &Path, log: &Path, timeout: Duration) {
@@ -243,7 +273,7 @@ fn saved_endpoint_connections_reuse_the_persisted_bridge_daemon() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let stable_socket = crate_persisted_path(&temp_dir);
+    let stable_socket = crate_persisted_path(&state_home);
     let _ = fs::remove_file(&stable_socket);
 
     // First client connection: the supervisor builds the bridge through the

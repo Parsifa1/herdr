@@ -74,9 +74,39 @@ fn persisted_socket_hash(profile_id: &str, target: &str, session: &str) -> Strin
     format!("{:016x}", hasher.finish())
 }
 
-fn crate_persisted_path(temp_dir: &Path, profile: &str, target: &str) -> PathBuf {
+fn crate_persisted_path(state_home: &Path, profile: &str, target: &str) -> PathBuf {
     let hash = persisted_socket_hash(profile, target, "default");
-    temp_dir.join(format!("herdr-qp-{profile}-{hash}.sock"))
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    let dir = state_home.join(app_dir).join("run");
+    // The binary falls back to the hashed short name when the readable one
+    // exceeds sun_path, so the expectation has to make the same choice.
+    let readable = dir.join(format!("herdr-qp-{profile}-{hash}.sock"));
+    if fits_socket_path(&readable) {
+        return readable;
+    }
+    let short = dir.join(format!("herdr-q-{}-{hash}.sock", &profile[..16]));
+    if fits_socket_path(&short) {
+        return short;
+    }
+    std::env::temp_dir()
+        .join(format!("herdr-{}", current_uid()))
+        .join(format!("herdr-q-{}-{hash}.sock", &profile[..16]))
+}
+
+fn current_uid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(std::env::temp_dir())
+        .expect("read the temp directory owner")
+        .uid()
+}
+
+fn fits_socket_path(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().len() <= 103
 }
 
 /// How many SSH commands the fake ssh has been asked to run so far.
@@ -316,7 +346,7 @@ impl Fixture {
     }
 
     fn stable_socket(&self) -> PathBuf {
-        crate_persisted_path(&self.temp_dir, &self.profile, &self.target)
+        crate_persisted_path(&self.state_home, &self.profile, &self.target)
     }
 
     fn ssh_calls(&self) -> usize {

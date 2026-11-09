@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ use crate::config::RemoteConfig;
 use crate::protocol::{
     RemoteBootstrapRecord, RemoteBootstrapRequest, RemoteQuicAccepted, RemoteQuicHello,
     MAX_FRAME_SIZE, REMOTE_QUIC_ALPN, REMOTE_QUIC_HASH_BYTES, REMOTE_QUIC_ID_BYTES,
-    REMOTE_QUIC_SCHEMA_VERSION, REMOTE_QUIC_TOKEN_BYTES,
+    REMOTE_QUIC_SCHEMA_VERSION,
 };
 use crate::remote::frame::{hash_bytes, lock, read_async_message, write_async_message};
 use crate::remote::quic_policy::{
@@ -34,14 +34,14 @@ use crate::remote::quic_policy::{
     REMOTE_QUIC_INITIAL_CONGESTION_WINDOW, REMOTE_QUIC_INITIAL_RTT,
 };
 
-const MAX_TOKENS: usize = 64;
+/// Client slots kept live at once. An authenticated device opens one slot per
+/// logical client it claims, so the bound is about memory, not trust.
+const MAX_CLIENTS: usize = 64;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A hello is a handful of scalars plus fixed-size identifiers; anything
 /// larger is a peer that cannot authenticate anyway, so it is refused before
 /// the decoder is handed a length it would trust.
 const MAX_HELLO_SIZE: usize = 4096;
-const TOKEN_MIN_LIFETIME: Duration = Duration::from_secs(60);
-const TOKEN_MAX_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// The server's own NAT keep-alive. The client drives resume probes; this is
 /// only the cheap heartbeat that keeps a middlebox binding warm well inside
 /// `remote.quic_transport_idle_timeout_seconds`.
@@ -74,23 +74,22 @@ const COPY_BUFFER_BYTES: usize = 64 * 1024;
 pub(crate) type AcceptedClientSink = Arc<dyn Fn(StdUnixStream) + Send + Sync>;
 
 #[derive(Debug)]
-struct Capability {
-    session: String,
-    logical_client_id: [u8; REMOTE_QUIC_ID_BYTES],
-    expires_unix_seconds: u64,
-    connection_generation: u64,
+struct ActiveClient {
     active_connection: Option<Connection>,
     issued_order: u64,
 }
 
+/// One remote client: the device certificate it authenticated with, plus the
+/// logical client it claims to be. The certificate digest comes from the TLS
+/// peer identity, so neither half can be chosen by an unauthenticated peer.
+type ClientKey = ([u8; REMOTE_QUIC_HASH_BYTES], [u8; REMOTE_QUIC_ID_BYTES]);
+
 struct ServerState {
     server_instance_id: [u8; REMOTE_QUIC_ID_BYTES],
-    tokens: Mutex<HashMap<[u8; REMOTE_QUIC_HASH_BYTES], Capability>>,
-    token_order: AtomicU64,
-    /// Lifetimes are a config value, fixed for the life of the process.
-    token_lifetime: Duration,
-    /// The single session this server process owns. A capability minted for
-    /// another session never validates here.
+    clients: Mutex<HashMap<ClientKey, ActiveClient>>,
+    client_order: AtomicU64,
+    /// The single session this server process owns. A device enrolled for
+    /// another session never authenticates here.
     active_session: String,
     sink: AcceptedClientSink,
 }
@@ -106,7 +105,6 @@ pub(crate) struct RemoteQuicServer {
     state: Arc<ServerState>,
     port: u16,
     identity: ServerIdentity,
-    token_lifetime: Duration,
     handed_off: AtomicBool,
 }
 
@@ -138,9 +136,8 @@ impl RemoteQuicServer {
         let server_instance_id = identity.server_instance_id;
         let state = Arc::new(ServerState {
             server_instance_id,
-            tokens: Mutex::new(HashMap::new()),
-            token_order: AtomicU64::new(1),
-            token_lifetime: token_lifetime(config),
+            clients: Mutex::new(HashMap::new()),
+            client_order: AtomicU64::new(1),
             active_session,
             sink,
         });
@@ -159,15 +156,15 @@ impl RemoteQuicServer {
             state,
             port,
             identity,
-            token_lifetime: token_lifetime(config),
             handed_off: AtomicBool::new(false),
         })
     }
 
     /// Rebuilds the endpoint in a successor process from an exported state and
     /// the inherited sockets. Server instance id, certificate, and port are
-    /// preserved, so a client's existing capability and pinned certificate
-    /// fingerprint keep validating: it reconnects instead of rebootstrapping
+    /// preserved, so a client's pinned certificate fingerprint keeps
+    /// validating and the device certificate it already enrolled with is still
+    /// the one the successor accepts: it reconnects instead of rebootstrapping
     /// over SSH.
     pub(crate) fn resume(
         config: &RemoteConfig,
@@ -202,44 +199,10 @@ impl RemoteQuicServer {
         }
         let endpoints = make_endpoints(&server_config, &sockets)?;
 
-        let now = unix_seconds();
-        let mut inherited: Vec<HandoffToken> = state
-            .tokens
-            .into_iter()
-            .filter(|token| token.expires_unix_seconds > now)
-            .collect();
-        // Newest capabilities win if the snapshot somehow carries more than
-        // this process would ever mint.
-        inherited.sort_unstable_by_key(|token| std::cmp::Reverse(token.issued_order));
-        inherited.truncate(MAX_TOKENS);
-        let token_order = inherited
-            .iter()
-            .map(|token| token.issued_order)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        let tokens = inherited
-            .into_iter()
-            .map(|token| {
-                (
-                    token.token_hash,
-                    Capability {
-                        session: token.session,
-                        logical_client_id: token.logical_client_id,
-                        expires_unix_seconds: token.expires_unix_seconds,
-                        connection_generation: token.connection_generation,
-                        active_connection: None,
-                        issued_order: token.issued_order,
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-
         let server_state = Arc::new(ServerState {
             server_instance_id: state.server_instance_id,
-            tokens: Mutex::new(tokens),
-            token_order: AtomicU64::new(token_order),
-            token_lifetime: token_lifetime(config),
+            clients: Mutex::new(HashMap::new()),
+            client_order: AtomicU64::new(1),
             active_session,
             sink,
         });
@@ -252,7 +215,6 @@ impl RemoteQuicServer {
         info!(
             port = state.port,
             endpoints = endpoints.len(),
-            capabilities = lock(&server_state.tokens).len(),
             "remote QUIC endpoint resumed from handoff"
         );
         Ok(Self {
@@ -261,7 +223,6 @@ impl RemoteQuicServer {
             state: server_state,
             port: state.port,
             identity,
-            token_lifetime: token_lifetime(config),
             handed_off: AtomicBool::new(false),
         })
     }
@@ -271,9 +232,12 @@ impl RemoteQuicServer {
         self.port
     }
 
-    /// Mints one capability for the session this server owns. The plaintext
-    /// token travels back over the authenticated SSH channel and is never
-    /// logged; the server keeps only its SHA-256.
+    /// Answers the SSH-authenticated caller with the information it cannot
+    /// learn locally: this endpoint's port and the identity to pin.
+    ///
+    /// Nothing here authorizes the client. Authorization is the device
+    /// certificate it presents on the QUIC handshake, so the reply carries no
+    /// secret and a copied hosts.json grants nothing.
     pub(crate) fn bootstrap(
         &self,
         request: &RemoteBootstrapRequest,
@@ -285,61 +249,18 @@ impl RemoteQuicServer {
             ));
         }
 
-        let mut token = [0u8; REMOTE_QUIC_TOKEN_BYTES];
-        getrandom::fill(&mut token)
-            .map_err(|err| format!("failed to generate remote capability: {err}"))?;
-        let token_hash = hash_bytes(&token);
-        let expires_unix_seconds = unix_seconds().saturating_add(self.token_lifetime.as_secs());
-        let issued_order = self.state.token_order.fetch_add(1, Ordering::Relaxed);
-
-        let mut tokens = lock(&self.state.tokens);
-        tokens.retain(|_, capability| capability.expires_unix_seconds > unix_seconds());
-        if tokens.len() >= MAX_TOKENS {
-            if let Some(oldest) = tokens
-                .iter()
-                .min_by_key(|(_, capability)| capability.issued_order)
-                .map(|(hash, _)| *hash)
-            {
-                if let Some(removed) = tokens.remove(&oldest) {
-                    if let Some(connection) = removed.active_connection {
-                        // The capability is gone from the table, so the token
-                        // this client holds can no longer validate: it has to
-                        // bootstrap a new one rather than retry with a
-                        // credential that now resolves to nothing.
-                        connection.close(
-                            VarInt::from_u32(REMOTE_QUIC_CLOSE_EVICTED),
-                            b"capability evicted",
-                        );
-                    }
-                }
-            }
-        }
-        tokens.insert(
-            token_hash,
-            Capability {
-                session: request.session.clone(),
-                logical_client_id: request.logical_client_id,
-                expires_unix_seconds,
-                connection_generation: 0,
-                active_connection: None,
-                issued_order,
-            },
-        );
-
         Ok(RemoteBootstrapRecord {
             schema_version: REMOTE_QUIC_SCHEMA_VERSION,
             server_instance_id: self.state.server_instance_id,
             port: self.port,
             certificate_fingerprint: self.identity.fingerprint,
-            capability_token: token,
-            expires_unix_seconds,
         })
     }
 
-    /// Snapshots everything a successor process needs to keep existing
-    /// capabilities usable, together with duplicates of the listening UDP
-    /// sockets (IPv4 first, then IPv6 when bound). The duplicates are what
-    /// travel to the successor; this process keeps its own.
+    /// Snapshots everything a successor process needs to serve the same
+    /// endpoint, together with duplicates of the listening UDP sockets (IPv4
+    /// first, then IPv6 when bound). The duplicates are what travel to the
+    /// successor; this process keeps its own.
     pub(crate) fn export_handoff(&self) -> io::Result<(RemoteQuicHandoffState, Vec<UdpSocket>)> {
         let mut sockets = Vec::with_capacity(self.sockets.len());
         for socket in &self.sockets {
@@ -351,17 +272,6 @@ impl RemoteQuicServer {
                 "too many remote QUIC sockets to hand off",
             )
         })?;
-        let tokens = lock(&self.state.tokens)
-            .iter()
-            .map(|(token_hash, capability)| HandoffToken {
-                token_hash: *token_hash,
-                session: capability.session.clone(),
-                logical_client_id: capability.logical_client_id,
-                expires_unix_seconds: capability.expires_unix_seconds,
-                connection_generation: capability.connection_generation,
-                issued_order: capability.issued_order,
-            })
-            .collect();
         Ok((
             RemoteQuicHandoffState {
                 server_instance_id: self.state.server_instance_id,
@@ -370,15 +280,14 @@ impl RemoteQuicServer {
                 certificate_fingerprint: self.identity.fingerprint,
                 port: self.port,
                 socket_fd_count,
-                tokens,
             },
             sockets,
         ))
     }
 
     /// Closes every endpoint with the handoff code, telling connected clients
-    /// to reconnect with the capability they already hold instead of
-    /// rebootstrapping over SSH. Suppresses the shutdown close on drop.
+    /// to reconnect with the device certificate they already enrolled instead
+    /// of rebootstrapping over SSH. Suppresses the shutdown close on drop.
     pub(crate) fn close_for_handoff(&self) {
         self.handed_off.store(true, Ordering::Release);
         for endpoint in &self.endpoints {
@@ -412,8 +321,10 @@ impl Drop for RemoteQuicServer {
     }
 }
 
-/// Everything a successor process needs to keep already-issued capabilities
-/// valid across a live handoff.
+/// Everything a successor process needs to serve the same QUIC endpoint across
+/// a live handoff. Client authorization does not travel with it: it comes from
+/// the device allowlist on disk and the certificate each client presents, so a
+/// client reconnects with what it already has.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RemoteQuicHandoffState {
     pub(crate) server_instance_id: [u8; REMOTE_QUIC_ID_BYTES],
@@ -424,24 +335,6 @@ pub(crate) struct RemoteQuicHandoffState {
     /// Number of UDP socket descriptors that travel with this state.
     #[serde(default)]
     pub(crate) socket_fd_count: u8,
-    pub(crate) tokens: Vec<HandoffToken>,
-}
-
-/// One capability, hashed rather than in the clear: the plaintext token never
-/// leaves the client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct HandoffToken {
-    pub(crate) token_hash: [u8; REMOTE_QUIC_HASH_BYTES],
-    pub(crate) session: String,
-    pub(crate) logical_client_id: [u8; REMOTE_QUIC_ID_BYTES],
-    pub(crate) expires_unix_seconds: u64,
-    pub(crate) connection_generation: u64,
-    pub(crate) issued_order: u64,
-}
-
-fn token_lifetime(config: &RemoteConfig) -> Duration {
-    Duration::from_secs(config.quic_idle_timeout_seconds)
-        .clamp(TOKEN_MIN_LIFETIME, TOKEN_MAX_LIFETIME)
 }
 
 fn parse_port_range(value: &str) -> Result<(u16, u16), String> {
@@ -714,7 +607,7 @@ async fn serve_connection(
         }
     };
 
-    let fence = validate_and_fence(&state, &connection, &hello)?;
+    validate_and_fence(&state, &connection, &hello)?;
     // The admission cap exists to bound work an *unauthenticated* peer can
     // start, so it ends here. Holding it for the connection's life turns the
     // cap into a limit on live sessions: a reconnect storm would occupy every
@@ -727,7 +620,6 @@ async fn serve_connection(
         &mut control_send,
         &RemoteQuicAccepted {
             schema_version: REMOTE_QUIC_SCHEMA_VERSION,
-            connection_generation: hello.connection_generation,
         },
         MAX_FRAME_SIZE,
     )
@@ -749,7 +641,6 @@ async fn serve_connection(
         });
     }
     control.abort();
-    clear_active_connection(&state, fence);
     Ok(())
 }
 
@@ -832,7 +723,7 @@ async fn serve_client_stream(
     tokio::select! {
         result = copy_stream(local_read, &mut send, Some(connection)) => {
             // The acceptor closed its end: this client's session is over as
-            // far as the server is concerned, but the capability and the
+            // far as the server is concerned, but the client slot and the
             // connection stay good for the next stream.
             result.map_err(|err| format!("remote QUIC uplink failed: {err}"))
         }
@@ -872,212 +763,130 @@ async fn copy_stream(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CapabilityValidationError {
+enum AuthRejection {
     ServerInstanceChanged,
-    UnknownOrRevoked,
-    Expired,
-    DifferentLogicalClient,
-    DifferentSession,
-    StaleGeneration,
+    DeviceNotAuthorized,
 }
 
-impl std::fmt::Display for CapabilityValidationError {
+impl std::fmt::Display for AuthRejection {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ServerInstanceChanged => {
-                formatter.write_str("remote server instance changed; SSH rebootstrap required")
-            }
-            Self::UnknownOrRevoked => {
-                formatter.write_str("remote capability is unknown or revoked")
-            }
-            Self::Expired => {
-                formatter.write_str("remote capability expired; SSH rebootstrap required")
-            }
-            Self::DifferentLogicalClient => {
-                formatter.write_str("remote capability belongs to a different logical client")
-            }
-            Self::DifferentSession => {
-                formatter.write_str("remote capability belongs to a different session")
-            }
-            Self::StaleGeneration => formatter.write_str("stale remote connection generation"),
+            Self::ServerInstanceChanged => formatter.write_str("remote server instance changed"),
+            Self::DeviceNotAuthorized => formatter.write_str("remote device is not authorized"),
         }
     }
 }
 
-fn validate_capability(
-    server_instance_id: [u8; REMOTE_QUIC_ID_BYTES],
-    tokens: &HashMap<[u8; REMOTE_QUIC_HASH_BYTES], Capability>,
-    hello: &RemoteQuicHello,
-    active_session: &str,
-    now: u64,
-) -> Result<[u8; REMOTE_QUIC_HASH_BYTES], CapabilityValidationError> {
-    if hello.server_instance_id != server_instance_id {
-        return Err(CapabilityValidationError::ServerInstanceChanged);
+fn reject(connection: &Connection, rejection: AuthRejection, device: Option<&str>) -> String {
+    // The peer gets one opaque reason: telling it "not enrolled" apart from
+    // "stale generation" is an oracle for a caller that has not authenticated
+    // yet. The variant stays in the log, where an operator can see it.
+    let detail = "remote connection rejected";
+    connection.close(VarInt::from_u32(REMOTE_QUIC_CLOSE_AUTH), detail.as_bytes());
+    let source = connection.remote_address();
+    // A refusal from a device the allowlist names is worth recording at the
+    // default level. An unknown peer can generate refusals at will, so those
+    // stay at debug: otherwise a stranger could push every earlier audit line
+    // out of the rotating log.
+    match device {
+        Some(name) => info!(
+            event = "remote.quic.auth.rejected",
+            device = %name,
+            source = %source,
+            rejection = %rejection,
+            "remote QUIC client rejected"
+        ),
+        None => debug!(
+            event = "remote.quic.auth.rejected",
+            source = %source,
+            rejection = %rejection,
+            "remote QUIC client rejected"
+        ),
     }
-    let token_hash = hash_bytes(&hello.capability_token);
-    let capability = tokens
-        .get(&token_hash)
-        .ok_or(CapabilityValidationError::UnknownOrRevoked)?;
-    if capability.expires_unix_seconds <= now {
-        return Err(CapabilityValidationError::Expired);
-    }
-    if capability.logical_client_id != hello.logical_client_id {
-        return Err(CapabilityValidationError::DifferentLogicalClient);
-    }
-    if capability.session != active_session {
-        return Err(CapabilityValidationError::DifferentSession);
-    }
-    if hello.connection_generation <= capability.connection_generation {
-        return Err(CapabilityValidationError::StaleGeneration);
-    }
-    Ok(token_hash)
-}
-
-/// Identifies one accepted connection inside its capability, so a connection
-/// that has since been replaced does not clear the live one's slot.
-#[derive(Clone, Copy)]
-struct ConnectionFence {
-    token_hash: [u8; REMOTE_QUIC_HASH_BYTES],
-    connection_generation: u64,
+    rejection.to_string()
 }
 
 fn validate_and_fence(
     state: &ServerState,
     connection: &Connection,
     hello: &RemoteQuicHello,
-) -> Result<ConnectionFence, String> {
-    let now = unix_seconds();
-    let mut tokens = lock(&state.tokens);
-    if let Some(certificate) = presented_device(connection) {
-        // A device that presents a certificate is identified by it: an
-        // unenrolled or revoked one is refused outright, even holding a token
-        // it obtained before revocation.
-        if !crate::remote::device::DeviceList::load(&crate::remote::device::devices_path())
-            .contains(&certificate)
-        {
-            let detail = "remote device certificate is not authorized";
-            connection.close(VarInt::from_u32(REMOTE_QUIC_CLOSE_AUTH), detail.as_bytes());
-            return Err(detail.to_owned());
-        }
-    }
-    let token_hash = match validate_capability(
-        state.server_instance_id,
-        &tokens,
-        hello,
-        &state.active_session,
-        now,
-    ) {
-        Ok(token_hash) => token_hash,
-        Err(error) => {
-            // An expired capability from an authenticated device is renewed
-            // instead: the device key is the durable identity, so asking the
-            // user's SSH session again would defeat the enrollment. A token
-            // this process never saw is the same situation after a restart --
-            // the table is memory-only. Any other failure is a real mismatch
-            // and stays fatal.
-            let renewable = matches!(
-                error,
-                CapabilityValidationError::Expired | CapabilityValidationError::UnknownOrRevoked
-            );
-            let renewed = renewable
-                .then(|| renew_device_capability(state, connection, hello, &mut *tokens, now))
-                .flatten();
-            match renewed {
-                Some(token_hash) => token_hash,
-                None => {
-                    connection.close(
-                        VarInt::from_u32(REMOTE_QUIC_CLOSE_AUTH),
-                        error.to_string().as_bytes(),
-                    );
-                    return Err(error.to_string());
-                }
-            }
-        }
+) -> Result<(), String> {
+    let Some(certificate) = presented_device(connection) else {
+        return Err(reject(connection, AuthRejection::DeviceNotAuthorized, None));
     };
-    let Some(capability) = tokens.get_mut(&token_hash) else {
-        return Err(CapabilityValidationError::UnknownOrRevoked.to_string());
-    };
-    if let Some(previous) = capability.active_connection.replace(connection.clone()) {
-        previous.close(
-            VarInt::from_u32(REMOTE_QUIC_CLOSE_REPLACED),
-            b"newer connection generation accepted",
-        );
-    }
-    capability.connection_generation = hello.connection_generation;
-    Ok(ConnectionFence {
-        token_hash,
-        connection_generation: hello.connection_generation,
-    })
-}
-
-/// Re-issues a capability for a device that authenticated with TLS. Every
-/// scope check that the stored capability can answer still runs; what changes
-/// is that a missing entry no longer ends the story.
-///
-/// The token table lives only in memory, so it dies with the server process.
-/// Without this, an enrolled device would have to run a fresh SSH bootstrap
-/// after every server restart, which is exactly the cost enrollment exists to
-/// remove. The device certificate is the durable identity here, and it was
-/// already checked against the authorized list, so a rebuilt entry grants no
-/// more than the enrollment did. Session and generation fencing still apply:
-/// the session comes from this server, never from the hello.
-fn renew_device_capability(
-    state: &ServerState,
-    connection: &Connection,
-    hello: &RemoteQuicHello,
-    tokens: &mut HashMap<[u8; REMOTE_QUIC_HASH_BYTES], Capability>,
-    now: u64,
-) -> Option<[u8; REMOTE_QUIC_HASH_BYTES]> {
-    if !connection_has_enrolled_device(connection) {
-        return None;
+    // Read per handshake rather than cached, so a revoke takes effect on this
+    // device's next connection.
+    let devices = crate::remote::device::DeviceList::load(&crate::remote::device::devices_path());
+    let authorized = devices.authorize(&certificate, &state.active_session);
+    let device = authorized
+        .map(|entry| entry.name.as_str())
+        .or_else(|| devices.enrolled_name(&certificate));
+    if authorized.is_none() {
+        return Err(reject(connection, AuthRejection::DeviceNotAuthorized, device));
     }
     if hello.server_instance_id != state.server_instance_id {
-        return None;
+        return Err(reject(connection, AuthRejection::ServerInstanceChanged, device));
     }
-    let token_hash = hash_bytes(&hello.capability_token);
-    let expires_unix_seconds = now.saturating_add(state.token_lifetime.as_secs());
-    match tokens.get_mut(&token_hash) {
-        Some(capability) => {
-            if capability.logical_client_id != hello.logical_client_id
-                || capability.session != state.active_session
-                || hello.connection_generation <= capability.connection_generation
-            {
-                return None;
-            }
-            capability.expires_unix_seconds = expires_unix_seconds;
-        }
-        None => {
-            // Generation 0 is what bootstrap mints; a caller that never held a
-            // capability has nothing to fence against.
-            if hello.connection_generation == 0 {
-                return None;
-            }
-            if tokens.len() >= MAX_TOKENS {
-                let oldest = tokens
-                    .iter()
-                    .min_by_key(|(_, capability)| capability.issued_order)
-                    .map(|(hash, _)| *hash)?;
-                tokens.remove(&oldest);
-            }
-            let issued_order = state.token_order.fetch_add(1, Ordering::Relaxed);
-            tokens.insert(
-                token_hash,
-                Capability {
-                    session: state.active_session.clone(),
-                    logical_client_id: hello.logical_client_id,
-                    expires_unix_seconds,
-                    connection_generation: 0,
-                    active_connection: None,
-                    issued_order,
-                },
-            );
-        }
+    let key = (hash_bytes(&certificate), hello.logical_client_id);
+    let mut clients = lock(&state.clients);
+    if !clients.contains_key(&key) {
+        evict_oldest_client(&mut clients);
+        let issued_order = state.client_order.fetch_add(1, Ordering::Relaxed);
+        clients.insert(
+            key,
+            ActiveClient {
+                active_connection: None,
+                issued_order,
+            },
+        );
     }
+    let Some(client) = clients.get_mut(&key) else {
+        return Err("remote client slot disappeared while fencing".to_owned());
+    };
+    // Whatever this slot held is superseded: the client dials only after its
+    // own session died, so the newer connection is the one that speaks for it.
+    if let Some(previous) = client.active_connection.replace(connection.clone()) {
+        previous.close(
+            VarInt::from_u32(REMOTE_QUIC_CLOSE_REPLACED),
+            b"newer connection accepted",
+        );
+    }
+    drop(clients);
+    // The audit line for the event this whole module exists to decide. Without
+    // it a shared host has no record of who connected, which is what an
+    // operator needs after any suspected compromise.
     info!(
+        event = "remote.quic.auth.accepted",
+        device = %device.unwrap_or("unknown-device"),
+        source = %connection.remote_address(),
         session = %state.active_session,
-        "remote QUIC capability renewed for an enrolled device"
+        "remote QUIC client authenticated"
     );
-    Some(token_hash)
+    Ok(())
+}
+
+/// Bounds the client table. An authenticated peer opens one slot per logical
+/// client id it claims, so the oldest slot makes room when the table is full.
+fn evict_oldest_client(clients: &mut HashMap<ClientKey, ActiveClient>) {
+    if clients.len() < MAX_CLIENTS {
+        return;
+    }
+    let Some(oldest) = clients
+        .iter()
+        .min_by_key(|(_, client)| client.issued_order)
+        .map(|(key, _)| *key)
+    else {
+        return;
+    };
+    let Some(removed) = clients.remove(&oldest) else {
+        return;
+    };
+    if let Some(connection) = removed.active_connection {
+        connection.close(
+            VarInt::from_u32(REMOTE_QUIC_CLOSE_EVICTED),
+            b"client slot evicted",
+        );
+    }
 }
 
 fn presented_device(connection: &Connection) -> Option<Vec<u8>> {
@@ -1089,31 +898,6 @@ fn presented_device(connection: &Connection) -> Option<Vec<u8>> {
                 .ok()
         })
         .and_then(|certificates| certificates.first().map(|certificate| certificate.to_vec()))
-}
-
-/// Whether the TLS handshake carried a client certificate the verifier
-/// accepted. quinn exposes it only after the handshake, which is why the
-/// renewal path re-checks instead of trusting the verifier's silence.
-fn connection_has_enrolled_device(connection: &Connection) -> bool {
-    presented_device(connection).is_some_and(|certificate| {
-        crate::remote::device::DeviceList::load(&crate::remote::device::devices_path())
-            .contains(&certificate)
-    })
-}
-
-fn clear_active_connection(state: &ServerState, fence: ConnectionFence) {
-    if let Some(capability) = lock(&state.tokens).get_mut(&fence.token_hash) {
-        if capability.connection_generation == fence.connection_generation {
-            capability.active_connection = None;
-        }
-    }
-}
-
-fn unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1131,18 +915,41 @@ mod tests {
         assert!(parse_port_range("invalid").is_err());
     }
 
-    /// Writes a device certificate into the server's authorized list under a
-    /// throwaway config root, so the real verifier runs against real files.
-    fn enroll_test_device(name: &str) -> crate::remote::device::DeviceIdentity {
-        let dir = std::env::temp_dir().join(format!("herdr-mtls-{name}-{}", std::process::id()));
+    /// Creates a device identity under a throwaway directory. The directory is
+    /// removed once the key and certificate are in memory.
+    fn test_device_identity(name: &str) -> crate::remote::device::DeviceIdentity {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-mtls-{name}-{}-{unique}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let identity =
             crate::remote::device::DeviceIdentity::load_or_create(&dir.join("device.json"))
                 .expect("create device identity");
-        crate::remote::device::enroll(&identity.certificate_der(), name).expect("enroll device");
         let _ = std::fs::remove_dir_all(&dir);
         identity
+    }
+
+    /// Writes a new device certificate into the server's authorized list under
+    /// the active config root, so the real verifier runs against real files.
+    fn enroll_test_device(name: &str) -> crate::remote::device::DeviceIdentity {
+        let identity = test_device_identity(name);
+        crate::remote::device::enroll(&identity.certificate_der(), name, TEST_SESSION)
+            .expect("enroll device");
+        identity
+    }
+
+    /// One identity for every dial that does not care which device it is.
+    /// Sharing it keeps two connections in one test attributable to the same
+    /// client slot, which is what the fencing tests need. Enrollment stays per
+    /// call because each test drives its own state root.
+    fn shared_test_device() -> &'static crate::remote::device::DeviceIdentity {
+        static DEVICE: std::sync::LazyLock<crate::remote::device::DeviceIdentity> =
+            std::sync::LazyLock::new(|| test_device_identity("shared"));
+        &DEVICE
     }
 
     #[tokio::test]
@@ -1150,15 +957,15 @@ mod tests {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let _root = StateRoot::new("mtls");
         let TestServer { server, .. } = test_server_on_free_port();
-        let record = mint(&server, 31);
+        let record = mint(&server);
 
         let identity = enroll_test_device("laptop");
-        let mut client = dial_with_hello_and_device(&record, 31, 1, Some(&identity)).await;
+        let mut client = dial_with_hello_and_device(&record, 31, Some(&identity)).await;
         let accepted_hello: RemoteQuicAccepted =
             read_async_message(&mut client.recv, MAX_HELLO_SIZE)
                 .await
                 .expect("an enrolled device is accepted");
-        assert_eq!(accepted_hello.connection_generation, 1);
+        assert_eq!(accepted_hello.schema_version, REMOTE_QUIC_SCHEMA_VERSION);
         drop(client);
 
         let mut devices =
@@ -1168,7 +975,7 @@ mod tests {
             .save(&crate::remote::device::devices_path())
             .expect("save revoked devices");
 
-        let mut revoked = dial_with_hello_and_device(&record, 31, 2, Some(&identity)).await;
+        let mut revoked = dial_with_hello_and_device(&record, 31, Some(&identity)).await;
         let refusal =
             read_async_message::<RemoteQuicAccepted>(&mut revoked.recv, MAX_HELLO_SIZE).await;
         assert!(
@@ -1178,176 +985,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_enrolled_device_renews_an_expired_capability() {
+    async fn a_device_enrolled_for_another_session_is_refused() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let _root = StateRoot::new("renew");
+        let _root = StateRoot::new("other-session");
         let TestServer { server, .. } = test_server_on_free_port();
-        let record = mint(&server, 32);
+        let record = mint(&server);
 
-        let token_hash = hash_bytes(&record.capability_token);
-        lock(&server.state.tokens)
-            .get_mut(&token_hash)
-            .expect("minted capability")
-            .expires_unix_seconds = 1;
+        let identity = test_device_identity("elsewhere");
+        crate::remote::device::enroll(&identity.certificate_der(), "elsewhere", "session-b")
+            .expect("enroll for another session");
 
-        let identity = enroll_test_device("desktop");
-        let mut client = dial_with_hello_and_device(&record, 32, 1, Some(&identity)).await;
-        let renewed: RemoteQuicAccepted = read_async_message(&mut client.recv, MAX_HELLO_SIZE)
-            .await
-            .expect("an enrolled device renews an expired capability");
-        assert_eq!(renewed.connection_generation, 1);
-        assert!(
-            lock(&server.state.tokens)
-                .get(&token_hash)
-                .is_some_and(|capability| capability.expires_unix_seconds > unix_seconds()),
-            "the stored capability was extended"
-        );
-        drop(client);
-    }
-
-    /// The token table is memory-only, so a server restart leaves an enrolled
-    /// device holding a token this process has never seen. It must still be
-    /// accepted: the certificate is the durable identity, and demanding SSH
-    /// again would make enrollment meaningless.
-    #[tokio::test]
-    async fn an_enrolled_device_survives_a_server_restart() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let _root = StateRoot::new("restart");
-        let TestServer { server, .. } = test_server_on_free_port();
-        let record = mint(&server, 33);
-        let identity = enroll_test_device("laptop");
-
-        // Stand in for a restart: the same identity survives, the table does not.
-        lock(&server.state.tokens).clear();
-
-        let mut client = dial_with_hello_and_device(&record, 33, 1, Some(&identity)).await;
-        let accepted: RemoteQuicAccepted = read_async_message(&mut client.recv, MAX_HELLO_SIZE)
-            .await
-            .expect("an enrolled device reconnects after the token table dies");
-        assert_eq!(accepted.connection_generation, 1);
-        assert!(
-            lock(&server.state.tokens).contains_key(&hash_bytes(&record.capability_token)),
-            "the rebuilt capability is stored for the next reconnect"
-        );
-        drop(client);
-    }
-
-    /// A device with no valid token and no generation has nothing to fence
-    /// against, so rebuilding an entry for it would mint authority from
-    /// nothing.
-    #[tokio::test]
-    async fn an_unknown_capability_without_a_generation_is_refused() {
-        let _lock = crate::config::test_config_env_lock().lock().unwrap();
-        let _root = StateRoot::new("restart-gen0");
-        let TestServer { server, .. } = test_server_on_free_port();
-        let record = mint(&server, 34);
-        let identity = enroll_test_device("phone");
-        lock(&server.state.tokens).clear();
-
-        let mut client = dial_with_hello_and_device(&record, 34, 0, Some(&identity)).await;
+        let mut client = dial_with_hello_and_device(&record, 32, Some(&identity)).await;
         let refusal =
             read_async_message::<RemoteQuicAccepted>(&mut client.recv, MAX_HELLO_SIZE).await;
         assert!(
             refusal.is_err(),
-            "generation 0 with no stored capability must not be renewed"
+            "an enrollment scoped to another session must not authenticate"
         );
-        assert!(lock(&server.state.tokens).is_empty(), "nothing was minted");
+        assert!(lock(&server.state.clients).is_empty(), "no slot was created");
         drop(client);
     }
 
-    fn capability_fixture() -> (
-        [u8; REMOTE_QUIC_ID_BYTES],
-        HashMap<[u8; REMOTE_QUIC_HASH_BYTES], Capability>,
-        RemoteQuicHello,
-    ) {
-        let server_instance_id = [2; REMOTE_QUIC_ID_BYTES];
-        let capability_token = [3; REMOTE_QUIC_TOKEN_BYTES];
-        let logical_client_id = [4; REMOTE_QUIC_ID_BYTES];
-        let mut tokens = HashMap::new();
-        tokens.insert(
-            hash_bytes(&capability_token),
-            Capability {
-                session: TEST_SESSION.to_owned(),
-                logical_client_id,
-                expires_unix_seconds: 2_000,
-                connection_generation: 0,
-                active_connection: None,
-                issued_order: 1,
-            },
+    #[tokio::test]
+    async fn an_unenrolled_device_is_refused() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _root = StateRoot::new("unenrolled");
+        let TestServer { server, .. } = test_server_on_free_port();
+        let record = mint(&server);
+
+        let identity = test_device_identity("stranger");
+        let mut client = dial_with_hello_and_device(&record, 34, Some(&identity)).await;
+        let refusal =
+            read_async_message::<RemoteQuicAccepted>(&mut client.recv, MAX_HELLO_SIZE).await;
+        assert!(
+            refusal.is_err(),
+            "a certificate the allowlist does not name must not authenticate"
         );
-        let hello = RemoteQuicHello {
-            schema_version: REMOTE_QUIC_SCHEMA_VERSION,
-            server_instance_id,
-            logical_client_id,
-            capability_token,
-            connection_generation: 1,
-        };
-        (server_instance_id, tokens, hello)
+        assert!(lock(&server.state.clients).is_empty(), "no slot was created");
+        drop(client);
     }
 
-    #[test]
-    fn capability_validation_rejects_identity_and_revocation_failures() {
-        let (server_instance_id, tokens, hello) = capability_fixture();
-        assert_eq!(
-            validate_capability(server_instance_id, &tokens, &hello, TEST_SESSION, 1_000),
-            Ok(hash_bytes(&hello.capability_token))
-        );
+    /// Client slots are process state, so a restart forgets them; the device
+    /// allowlist is on disk, so the same device reconnects without SSH.
+    #[tokio::test]
+    async fn an_enrolled_device_reconnects_after_a_server_restart() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _root = StateRoot::new("restart");
+        let TestServer { server, .. } = test_server_on_free_port();
+        let record = mint(&server);
+        let identity = enroll_test_device("laptop");
 
-        assert_eq!(
-            validate_capability(
-                [9; REMOTE_QUIC_ID_BYTES],
-                &tokens,
-                &hello,
-                TEST_SESSION,
-                1_000
-            ),
-            Err(CapabilityValidationError::ServerInstanceChanged)
-        );
-        assert_eq!(
-            validate_capability(
-                server_instance_id,
-                &HashMap::new(),
-                &hello,
-                TEST_SESSION,
-                1_000,
-            ),
-            Err(CapabilityValidationError::UnknownOrRevoked)
-        );
-    }
+        lock(&server.state.clients).clear();
 
-    #[test]
-    fn capability_validation_rejects_expiry_cross_scope_and_stale_generation() {
-        let (server_instance_id, mut tokens, hello) = capability_fixture();
+        let mut client = dial_with_hello_and_device(&record, 33, Some(&identity)).await;
+        let accepted: RemoteQuicAccepted = read_async_message(&mut client.recv, MAX_HELLO_SIZE)
+            .await
+            .expect("an enrolled device reconnects after the slot table dies");
+        assert_eq!(accepted.schema_version, REMOTE_QUIC_SCHEMA_VERSION);
         assert_eq!(
-            validate_capability(server_instance_id, &tokens, &hello, TEST_SESSION, 2_000),
-            Err(CapabilityValidationError::Expired)
+            lock(&server.state.clients).len(),
+            1,
+            "the slot is rebuilt for the next reconnect"
         );
-
-        let mut wrong_client = hello.clone();
-        wrong_client.logical_client_id = [9; REMOTE_QUIC_ID_BYTES];
-        assert_eq!(
-            validate_capability(
-                server_instance_id,
-                &tokens,
-                &wrong_client,
-                TEST_SESSION,
-                1_000,
-            ),
-            Err(CapabilityValidationError::DifferentLogicalClient)
-        );
-        assert_eq!(
-            validate_capability(server_instance_id, &tokens, &hello, "session-b", 1_000),
-            Err(CapabilityValidationError::DifferentSession)
-        );
-
-        tokens
-            .get_mut(&hash_bytes(&hello.capability_token))
-            .expect("fixture capability")
-            .connection_generation = hello.connection_generation;
-        assert_eq!(
-            validate_capability(server_instance_id, &tokens, &hello, TEST_SESSION, 1_000),
-            Err(CapabilityValidationError::StaleGeneration)
-        );
+        drop(client);
     }
 
     /// The admission cap bounds work an unauthenticated peer can start. Once a
@@ -1365,8 +1065,8 @@ mod tests {
         let mut clients = Vec::new();
         for index in 0..(MAX_PREAUTH_CONNECTIONS + 4) {
             let logical_client_id = u8::try_from(index % 200).expect("id fits a byte");
-            let record = mint(&server, logical_client_id);
-            let mut client = dial_with_hello_and_device(&record, logical_client_id, 1, None).await;
+            let record = mint(&server);
+            let mut client = dial_with_hello(&record, logical_client_id).await;
             let accepted_hello: RemoteQuicAccepted =
                 read_async_message(&mut client.recv, MAX_HELLO_SIZE)
                     .await
@@ -1376,7 +1076,7 @@ mod tests {
                              permit was not released on authentication: {err}"
                         )
                     });
-            assert_eq!(accepted_hello.connection_generation, 1);
+            assert_eq!(accepted_hello.schema_version, REMOTE_QUIC_SCHEMA_VERSION);
             clients.push(client);
         }
         assert_eq!(
@@ -1402,9 +1102,8 @@ mod tests {
     }
 
     #[test]
-    fn transport_idle_timeout_is_separate_from_token_lifetime() {
+    fn transport_idle_timeout_is_independent_of_the_client_table() {
         let config = RemoteConfig::default();
-        assert_eq!(token_lifetime(&config), Duration::from_secs(86_400));
 
         let transport =
             transport_config(config.validated_transport_idle_timeout()).expect("transport config");
@@ -1416,7 +1115,7 @@ mod tests {
                 "max_idle_timeout: {:?}",
                 Some(VarInt::from_u32(expected_idle))
             )),
-            "transport must idle out on the transport timeout, not the token lifetime: {rendered}"
+            "transport must idle out on the transport timeout, not on any authorization clock: {rendered}"
         );
         assert!(
             rendered.contains(&format!(
@@ -1458,13 +1157,12 @@ mod tests {
         TestServer { server, accepted }
     }
 
-    fn mint(server: &RemoteQuicServer, logical_client_id: u8) -> RemoteBootstrapRecord {
+    fn mint(server: &RemoteQuicServer) -> RemoteBootstrapRecord {
         server
             .bootstrap(&RemoteBootstrapRequest {
                 session: TEST_SESSION.to_owned(),
-                logical_client_id: [logical_client_id; REMOTE_QUIC_ID_BYTES],
             })
-            .expect("mint capability")
+            .expect("bootstrap the endpoint")
     }
 
     /// Test-only stand-in for the client's own fingerprint verifier: these
@@ -1538,12 +1236,16 @@ mod tests {
 
     /// Dials the real endpoint and sends `hello`, without assuming the server
     /// accepts it: rejection tests need exactly this much of the handshake.
+    /// The device certificate is the only authenticator the endpoint takes, so
+    /// every dial presents one.
     async fn dial_with_hello(
         record: &RemoteBootstrapRecord,
         logical_client_id: u8,
-        connection_generation: u64,
     ) -> LiveTestClient {
-        dial_with_hello_and_device(record, logical_client_id, connection_generation, None).await
+        let device = shared_test_device();
+        crate::remote::device::enroll(&device.certificate_der(), "shared", TEST_SESSION)
+            .expect("enroll the shared device for this state root");
+        dial_with_hello_and_device(record, logical_client_id, Some(device)).await
     }
 
     /// Same dial, optionally presenting a device certificate so the server's
@@ -1551,7 +1253,6 @@ mod tests {
     async fn dial_with_hello_and_device(
         record: &RemoteBootstrapRecord,
         logical_client_id: u8,
-        connection_generation: u64,
         device: Option<&crate::remote::device::DeviceIdentity>,
     ) -> LiveTestClient {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -1594,8 +1295,6 @@ mod tests {
             schema_version: REMOTE_QUIC_SCHEMA_VERSION,
             server_instance_id: record.server_instance_id,
             logical_client_id: [logical_client_id; REMOTE_QUIC_ID_BYTES],
-            capability_token: record.capability_token,
-            connection_generation,
         };
         write_async_message(&mut send, &hello, MAX_FRAME_SIZE)
             .await
@@ -1611,14 +1310,12 @@ mod tests {
     async fn connect_live_test_client(
         record: &RemoteBootstrapRecord,
         logical_client_id: u8,
-        connection_generation: u64,
     ) -> LiveTestClient {
-        let mut client = dial_with_hello(record, logical_client_id, connection_generation).await;
+        let mut client = dial_with_hello(record, logical_client_id).await;
         let accepted: RemoteQuicAccepted = read_async_message(&mut client.recv, MAX_HELLO_SIZE)
             .await
             .expect("read accepted");
         assert_eq!(accepted.schema_version, REMOTE_QUIC_SCHEMA_VERSION);
-        assert_eq!(accepted.connection_generation, connection_generation);
         // The hello stream stays as the liveness channel; a session rides on
         // its own stream, the way the multiplexing bridge attaches one.
         let (send, recv) = client.connection.open_bi().await.expect("open data stream");
@@ -1641,26 +1338,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_tokens_have_bounded_inventory_lifetime_and_session_scope() {
+    async fn bootstrap_reports_the_endpoint_and_refuses_a_foreign_session() {
         let TestServer { server, .. } = test_server_on_free_port();
         assert!(server
             .bootstrap(&RemoteBootstrapRequest {
                 session: format!("{TEST_SESSION}-wrong"),
-                logical_client_id: [0; REMOTE_QUIC_ID_BYTES],
             })
             .is_err());
 
-        let issued_at = unix_seconds();
-        let first = mint(&server, 0);
+        let first = mint(&server);
         assert_eq!(first.schema_version, REMOTE_QUIC_SCHEMA_VERSION);
-        let lifetime = token_lifetime(&RemoteConfig::default()).as_secs();
-        assert!(first.expires_unix_seconds >= issued_at + lifetime);
-        assert!(first.expires_unix_seconds <= issued_at + lifetime + 1);
-
-        for index in 1..=MAX_TOKENS {
-            mint(&server, index as u8);
-        }
-        assert_eq!(lock(&server.state.tokens).len(), MAX_TOKENS);
+        assert_eq!(first.port, server.port);
+        assert_eq!(first.certificate_fingerprint, server.identity.fingerprint);
+        assert!(
+            lock(&server.state.clients).is_empty(),
+            "bootstrap hands out no authority of its own"
+        );
     }
 
     /// The whole point of the adapter: the acceptor gets an ordinary Unix
@@ -1671,8 +1364,8 @@ mod tests {
             server,
             mut accepted,
         } = test_server_on_free_port();
-        let record = mint(&server, 21);
-        let mut client = connect_live_test_client(&record, 21, 1).await;
+        let record = mint(&server);
+        let mut client = connect_live_test_client(&record, 21).await;
 
         client
             .send
@@ -1732,8 +1425,8 @@ mod tests {
             server,
             mut accepted,
         } = test_server_on_free_port();
-        let record = mint(&server, 31);
-        let mut client = connect_live_test_client(&record, 31, 1).await;
+        let record = mint(&server);
+        let mut client = connect_live_test_client(&record, 31).await;
         client.send.write_all(b"ping").await.expect("write ping");
         let adapted = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
             .await
@@ -1768,8 +1461,8 @@ mod tests {
     async fn a_health_ping_on_the_hello_stream_is_answered_with_a_pong() {
         let TestServer { server, accepted } = test_server_on_free_port();
         drop(accepted);
-        let record = mint(&server, 41);
-        let mut client = dial_with_hello(&record, 41, 1).await;
+        let record = mint(&server);
+        let mut client = dial_with_hello(&record, 41).await;
         let _accepted: RemoteQuicAccepted = read_async_message(&mut client.recv, MAX_HELLO_SIZE)
             .await
             .expect("read accepted");
@@ -1789,17 +1482,16 @@ mod tests {
         }
     }
 
-    /// A roamed client re-dials with the next generation of the same
-    /// credential; the connection it is replacing must be told, or two clients
-    /// would own one session.
+    /// A roamed client re-dials under the same process id; the connection it
+    /// is replacing must be told, or two clients would own one session.
     #[tokio::test]
-    async fn a_newer_generation_replaces_the_live_connection() {
+    async fn a_newer_connection_replaces_the_live_one() {
         let TestServer {
             server,
             mut accepted,
         } = test_server_on_free_port();
-        let record = mint(&server, 22);
-        let mut first = connect_live_test_client(&record, 22, 1).await;
+        let record = mint(&server);
+        let mut first = connect_live_test_client(&record, 22).await;
         first
             .send
             .write_all(b"x")
@@ -1810,7 +1502,7 @@ mod tests {
             .expect("first client reaches the acceptor")
             .expect("sink channel open");
 
-        let mut second = connect_live_test_client(&record, 22, 2).await;
+        let mut second = connect_live_test_client(&record, 22).await;
         second
             .send
             .write_all(b"x")
@@ -1825,52 +1517,18 @@ mod tests {
             .expect("second client reaches the acceptor")
             .expect("sink channel open");
 
-        // The replaced connection must not clear the live one's slot.
-        let token_hash = hash_bytes(&record.capability_token);
-        for _ in 0..50 {
-            if lock(&server.state.tokens)
-                .get(&token_hash)
-                .is_some_and(|capability| capability.connection_generation == 2)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let tokens = lock(&server.state.tokens);
-        let capability = tokens.get(&token_hash).expect("capability survives");
-        assert_eq!(capability.connection_generation, 2);
-        assert!(capability.active_connection.is_some());
-        drop(tokens);
-        drop(second);
-    }
-
-    /// A stale generation cannot be used to take a session over, and it costs
-    /// the client its credential: the only way forward is a fresh bootstrap.
-    #[tokio::test]
-    async fn a_stale_generation_is_rejected_as_an_auth_failure() {
-        let TestServer {
-            server,
-            mut accepted,
-        } = test_server_on_free_port();
-        let record = mint(&server, 23);
-        let mut first = connect_live_test_client(&record, 23, 2).await;
-        // Held: dropping the acceptor's socket would end the live connection
-        // for resync, which is not the rejection this test is about.
-        first
-            .send
-            .write_all(b"x")
-            .await
-            .expect("wake the accept loop");
-        let _first_socket = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
-            .await
-            .expect("first client reaches the acceptor")
-            .expect("sink channel open");
-        let stale = dial_with_hello(&record, 23, 1).await;
-        assert_eq!(
-            closed_code(&stale.connection).await,
-            u64::from(REMOTE_QUIC_CLOSE_AUTH)
+        // The slot names the connection that replaced the first one, and
+        // nothing on the way out can take it away.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let key = (
+            hash_bytes(&shared_test_device().certificate_der()),
+            [22; REMOTE_QUIC_ID_BYTES],
         );
-        assert!(first.connection.close_reason().is_none());
+        let clients = lock(&server.state.clients);
+        let client = clients.get(&key).expect("client slot survives");
+        assert!(client.active_connection.is_some());
+        drop(clients);
+        drop(second);
     }
 
     /// A graceful shutdown closes every endpoint, so a remote client learns it
@@ -1882,8 +1540,8 @@ mod tests {
             server,
             mut accepted,
         } = test_server_on_free_port();
-        let record = mint(&server, 25);
-        let mut client = connect_live_test_client(&record, 25, 1).await;
+        let record = mint(&server);
+        let mut client = connect_live_test_client(&record, 25).await;
         client
             .send
             .write_all(b"x")
@@ -1901,16 +1559,18 @@ mod tests {
         );
     }
 
-    /// Eviction removes the capability itself, so the token the client holds
-    /// can never validate again: it has to bootstrap a new one.
+    /// Eviction removes the client slot, and with it the connection that owned
+    /// it: the table is bounded, so the oldest slot makes room.
     #[tokio::test]
-    async fn evicting_a_capability_closes_its_connection_as_evicted() {
+    async fn evicting_a_client_slot_closes_its_connection_as_evicted() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let _root = StateRoot::new("evict");
         let TestServer {
             server,
             mut accepted,
         } = test_server_on_free_port();
-        let record = mint(&server, 24);
-        let mut client = connect_live_test_client(&record, 24, 1).await;
+        let record = mint(&server);
+        let mut client = connect_live_test_client(&record, 24).await;
         client
             .send
             .write_all(b"x")
@@ -1921,12 +1581,24 @@ mod tests {
             .expect("client reaches the acceptor")
             .expect("sink channel open");
 
-        // The live client holds the oldest capability, so overflowing the
-        // token table evicts exactly that one.
-        for index in 0..=MAX_TOKENS {
-            mint(&server, index as u8);
+        // Distinct logical client ids from one enrolled device fill the table
+        // with distinct slots, so the oldest is the one this test holds.
+        for index in 0..=u8::try_from(MAX_CLIENTS).expect("slot cap fits a byte") {
+            let id = index.saturating_add(1);
+            if id == 24 {
+                continue;
+            }
+            let extra = mint(&server);
+            let mut extra_client = connect_live_test_client(&extra, id).await;
+            extra_client
+                .send
+                .write_all(b"x")
+                .await
+                .expect("wake the accept loop");
+            let _ = tokio::time::timeout(Duration::from_secs(5), accepted.recv()).await;
+            std::mem::forget(extra_client);
         }
-        assert!(!lock(&server.state.tokens).contains_key(&hash_bytes(&record.capability_token)));
+        assert_eq!(lock(&server.state.clients).len(), MAX_CLIENTS);
         assert_eq!(
             closed_code(&client.connection).await,
             u64::from(REMOTE_QUIC_CLOSE_EVICTED)
@@ -1934,10 +1606,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handoff_export_and_import_keep_capabilities_valid() {
+    async fn handoff_export_and_import_keep_serving_the_same_endpoint() {
         let TestServer { server, .. } = test_server_on_free_port();
         let port = server.port;
-        let record = mint(&server, 7);
+        let record = mint(&server);
 
         let (state, sockets) = server.export_handoff().expect("export handoff");
         assert_eq!(usize::from(state.socket_fd_count), sockets.len());
@@ -1948,7 +1620,6 @@ mod tests {
             record.certificate_fingerprint
         );
         assert_eq!(state.server_instance_id, record.server_instance_id);
-        assert_eq!(state.tokens.len(), 1);
 
         server.close_for_handoff();
         drop(server);
@@ -1962,7 +1633,7 @@ mod tests {
             RemoteQuicServer::resume(&config, TEST_SESSION.to_owned(), sink, state, sockets)
                 .expect("import handoff");
         // Same listening socket, same identity: the client's pinned
-        // fingerprint and its capability both still apply.
+        // fingerprint still applies.
         assert_eq!(resumed.port, port);
         assert_eq!(
             resumed
@@ -1976,33 +1647,22 @@ mod tests {
         );
         assert_eq!(resumed.identity.fingerprint, record.certificate_fingerprint);
 
-        // The credential minted before the handoff still validates against the
-        // successor's inherited table.
-        let hello = RemoteQuicHello {
-            schema_version: REMOTE_QUIC_SCHEMA_VERSION,
-            server_instance_id: record.server_instance_id,
-            logical_client_id: [7; REMOTE_QUIC_ID_BYTES],
-            capability_token: record.capability_token,
-            connection_generation: 1,
-        };
-        let tokens = lock(&resumed.state.tokens);
-        assert_eq!(
-            validate_capability(
-                resumed.state.server_instance_id,
-                &tokens,
-                &hello,
-                TEST_SESSION,
-                unix_seconds(),
-            ),
-            Ok(hash_bytes(&record.capability_token))
-        );
-        drop(tokens);
+        // The device allowlist is on disk, so the successor authenticates the
+        // same certificate without any capability travelling with the state.
+        let identity = shared_test_device();
+        crate::remote::device::enroll(&identity.certificate_der(), "shared", TEST_SESSION)
+            .expect("enroll the shared device");
+        let mut client = dial_with_hello_and_device(&record, 8, Some(identity)).await;
+        let accepted: RemoteQuicAccepted = read_async_message(&mut client.recv, MAX_HELLO_SIZE)
+            .await
+            .expect("the successor accepts the enrolled device");
+        assert_eq!(accepted.schema_version, REMOTE_QUIC_SCHEMA_VERSION);
+        drop(client);
 
-        // Freshly minted capabilities order after the inherited ones.
-        let next = mint(&resumed, 8);
+        let next = mint(&resumed);
         assert_eq!(next.server_instance_id, record.server_instance_id);
         assert_eq!(next.certificate_fingerprint, record.certificate_fingerprint);
-        assert_eq!(lock(&resumed.state.tokens).len(), 2);
+        assert_eq!(lock(&resumed.state.clients).len(), 1);
     }
 
     /// Points both XDG roots at a throwaway directory so the identity files a

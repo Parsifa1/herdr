@@ -927,8 +927,16 @@ pub(crate) fn remote_private_temp_base() -> PathBuf {
     crate::config::state_dir().join("remote")
 }
 
-pub(crate) fn remote_bridge_endpoint_path(_readable_name: &str, short_name: &str) -> PathBuf {
-    remote_private_temp_base().join(short_name)
+pub(crate) fn remote_bridge_socket_dir() -> std::io::Result<PathBuf> {
+    Ok(remote_private_temp_base())
+}
+
+pub(crate) fn remote_bridge_endpoint_path(
+    _dir: &std::path::Path,
+    _readable_name: &str,
+    short_name: &str,
+) -> std::io::Result<PathBuf> {
+    Ok(remote_private_temp_base().join(short_name))
 }
 
 pub(crate) fn remote_reattach_program(program: &str) -> String {

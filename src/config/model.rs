@@ -1076,9 +1076,6 @@ pub struct RemoteConfig {
     pub manage_ssh_config: bool,
     /// Inclusive unprivileged UDP port range used by the lazy QUIC listener.
     pub quic_port_range: String,
-    /// How long an SSH-minted QUIC credential stays valid for fresh
-    /// reconnects without re-running SSH. Default: 86400 seconds.
-    pub quic_idle_timeout_seconds: u64,
     /// How long a silent QUIC connection is kept before the server declares
     /// it dead. Default: 180 seconds, longer than the client's 150 s roaming
     /// grace so a tunnel-length blackhole migrates instead of reconnecting.
@@ -1095,7 +1092,6 @@ impl Default for RemoteConfig {
             transport: RemoteTransportConfig::Auto,
             manage_ssh_config: true,
             quic_port_range: "48000-48100".to_owned(),
-            quic_idle_timeout_seconds: 86_400,
             quic_transport_idle_timeout_seconds: 180,
             bridge_idle_timeout_seconds: 600,
         }

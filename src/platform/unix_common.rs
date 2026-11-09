@@ -503,17 +503,80 @@ pub(crate) fn remote_private_temp_base() -> PathBuf {
     std::env::temp_dir()
 }
 
-pub(crate) fn remote_bridge_endpoint_path(readable_name: &str, short_name: &str) -> PathBuf {
-    let tmp = std::env::temp_dir();
-    let readable = tmp.join(readable_name);
-    if fits_unix_socket_path(&readable) {
-        return readable;
+/// Directory that holds bridge sockets for saved endpoints. Private to this
+/// user, unlike the shared temp directory these sockets used to live in.
+pub(crate) fn remote_bridge_socket_dir() -> std::io::Result<PathBuf> {
+    let dir = crate::config::state_dir().join("run");
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    let short = tmp.join(short_name);
-    if fits_unix_socket_path(&short) {
-        return short;
+    match create_remote_private_dir(&dir) {
+        Ok(()) => Ok(dir),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(dir),
+        Err(err) => Err(err),
     }
-    PathBuf::from("/tmp").join(short_name)
+}
+
+/// A private, per-uid directory directly under the platform temp directory.
+///
+/// The state directory can sit deep enough that a socket path overflows
+/// `sun_path`, and a name in the shared temp directory would let another local
+/// user bind it first. A `0700` directory named after this uid gives a short
+/// path with the same guarantee: only this user can create entries in it.
+fn private_temp_socket_dir() -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let uid = unsafe { libc::getuid() };
+    let dir = std::env::temp_dir().join(format!("herdr-{uid}"));
+    match create_remote_private_dir(&dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err),
+    }
+    let metadata = std::fs::symlink_metadata(&dir)?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a private directory for uid {uid}",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(dir)
+}
+
+/// Builds a bridge socket path inside a caller-supplied private directory.
+///
+/// The directory must belong to this user (the state dir does). A socket in a
+/// shared directory is reachable by any local user, and a client that accepts
+/// whatever answers there would hand its protocol traffic to them, so the
+/// fallback for an over-long path is another private directory rather than a
+/// world-writable one.
+pub(crate) fn remote_bridge_endpoint_path(
+    dir: &Path,
+    readable_name: &str,
+    short_name: &str,
+) -> std::io::Result<PathBuf> {
+    for candidate in [dir.join(readable_name), dir.join(short_name)] {
+        if fits_unix_socket_path(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    let fallback = private_temp_socket_dir()?;
+    for candidate in [fallback.join(short_name), fallback.join(readable_name)] {
+        if fits_unix_socket_path(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "no private directory has room for a unix socket: {} and {} are too long",
+            dir.display(),
+            fallback.display()
+        ),
+    ))
 }
 
 pub(crate) fn remote_reattach_program(program: &str) -> String {

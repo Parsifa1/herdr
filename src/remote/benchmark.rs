@@ -335,14 +335,11 @@ impl BenchServer {
     /// Mint a QUIC credential over the client socket, which is also this
     /// bench's readiness probe: a served bootstrap proves the event loop runs.
     /// Retries until the socket exists and the loop answers.
-    fn bootstrap(
-        &self,
-        logical_client_id: [u8; crate::protocol::REMOTE_QUIC_ID_BYTES],
-    ) -> RemoteBootstrapRecord {
+    fn bootstrap(&self) -> RemoteBootstrapRecord {
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut last = String::from("server never accepted a connection");
         while Instant::now() < deadline {
-            match self.try_bootstrap(logical_client_id) {
+            match self.try_bootstrap() {
                 Ok(record) => return record,
                 Err(detail) => last = detail,
             }
@@ -351,10 +348,7 @@ impl BenchServer {
         panic!("remote bootstrap never succeeded: {last}");
     }
 
-    fn try_bootstrap(
-        &self,
-        logical_client_id: [u8; crate::protocol::REMOTE_QUIC_ID_BYTES],
-    ) -> Result<RemoteBootstrapRecord, String> {
+    fn try_bootstrap(&self) -> Result<RemoteBootstrapRecord, String> {
         let mut stream = UnixStream::connect(&self.client_socket).map_err(|err| err.to_string())?;
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -363,7 +357,6 @@ impl BenchServer {
             &mut stream,
             &ClientMessage::RemoteBootstrap(RemoteBootstrapRequest {
                 session: crate::session::DEFAULT_SESSION_NAME.to_owned(),
-                logical_client_id,
             }),
         )
         .map_err(|err| err.to_string())?;
@@ -914,7 +907,7 @@ fn remote_quic_3g_benchmark() {
     let count = keystrokes();
     let mut server = BenchServer::start();
     let logical_client_id = QuicBridgeConfig::process_logical_client_id();
-    let record = server.bootstrap(logical_client_id);
+    let record = server.bootstrap();
     let relay = ShapedRelay::start(SocketAddr::from((Ipv4Addr::LOCALHOST, record.port)));
     println!(
         "bench: server QUIC port {}, relay {} (3G shaping in userspace)",

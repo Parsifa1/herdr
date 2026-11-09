@@ -57,7 +57,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     crate::logging::init_file_logging("herdr-remote.log");
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
-    let local_socket = local_forward_socket_path(&remote.target, &session_name);
+    let local_socket = local_forward_socket_path(&remote.target, &session_name)?;
     let program = std::env::args()
         .next()
         .unwrap_or_else(|| "herdr".to_string());
@@ -2443,7 +2443,7 @@ fn probe_remote_endpoint(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<crate::client::endpoint::EndpointNegotiation> {
-    let path = local_forward_socket_path(ssh.target(), &ssh.session_name);
+    let path = local_forward_socket_path(ssh.target(), &ssh.session_name)?;
     let bridge = SshStdioBridge::start(
         ssh.target.clone(),
         remote_herdr.clone(),
@@ -3697,7 +3697,7 @@ fn configure_remote_client_environment(
     Ok(())
 }
 
-fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
+fn local_forward_socket_path(target: &str, session_name: &str) -> io::Result<PathBuf> {
     let pid = std::process::id();
     let target_clean = sanitize_path_component(target);
     let session_clean = sanitize_path_component(session_name);
@@ -3705,7 +3705,8 @@ fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
     let target_prefix: String = target_clean.chars().take(8).collect();
     let hash = short_socket_hash(target, session_name);
     let short_name = format!("herdr-r-{pid}-{target_prefix}-{hash}.sock");
-    crate::platform::remote_bridge_endpoint_path(&readable_name, &short_name)
+    let dir = crate::platform::remote_bridge_socket_dir()?;
+    crate::platform::remote_bridge_endpoint_path(&dir, &readable_name, &short_name)
 }
 
 #[cfg(all(test, unix))]
@@ -3923,7 +3924,7 @@ mod tests {
 
     #[cfg(unix)]
     fn upload_test_streams(name: &str) -> (crate::ipc::LocalStream, crate::ipc::LocalStream) {
-        let socket = local_forward_socket_path(name, "upload-test");
+        let socket = local_forward_socket_path(name, "upload-test").expect("socket path");
         let listener = crate::ipc::bind_private_local_listener(&socket).unwrap();
         let client = crate::ipc::connect_local_stream(&socket).unwrap();
         let server = listener.accept().unwrap();
@@ -4174,7 +4175,7 @@ mod tests {
 
     #[test]
     fn bridge_drop_while_waiting_for_client_is_bounded() {
-        let socket = local_forward_socket_path("drop-test", "default");
+        let socket = local_forward_socket_path("drop-test", "default").expect("socket path");
         let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
@@ -6223,7 +6224,7 @@ function Get-Process {
     #[cfg(windows)]
     #[test]
     fn windows_local_forward_endpoint_uses_private_state_dir() {
-        let path = local_forward_socket_path("user@example.com", "work");
+        let path = local_forward_socket_path("user@example.com", "work").expect("socket path");
         assert!(path.starts_with(crate::platform::remote_private_temp_base()));
         assert!(path
             .file_name()
@@ -6248,7 +6249,7 @@ function Get-Process {
         let _guard = remote_env_lock().lock().unwrap();
         // Short target + session leave plenty of room — keep the human-
         // readable form so the socket path stays grep-friendly.
-        let path = local_forward_socket_path("dev", "default");
+        let path = local_forward_socket_path("dev", "default").expect("socket path");
         let filename = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -6269,14 +6270,40 @@ function Get-Process {
 
     #[cfg(unix)]
     #[test]
+    fn local_forward_socket_path_stays_in_the_private_state_dir() {
+        let _guard = remote_env_lock().lock().unwrap();
+        // The socket must not land anywhere another local user can bind first,
+        // so the shared temp directory no longer decides where it goes.
+        let prior = std::env::var_os("TMPDIR");
+        std::env::set_var("TMPDIR", "/tmp");
+        let path = local_forward_socket_path("dev", "default").expect("socket path");
+        match prior {
+            Some(value) => std::env::set_var("TMPDIR", value),
+            None => std::env::remove_var("TMPDIR"),
+        }
+        let dir = crate::platform::remote_bridge_socket_dir().expect("socket dir");
+        assert!(
+            path.starts_with(&dir),
+            "expected a socket under {}, got {}",
+            dir.display(),
+            path.display()
+        );
+        assert!(
+            !path.starts_with("/tmp/herdr"),
+            "the shared temp directory must not own the socket: {}",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn local_forward_socket_path_fits_in_sun_path() {
         let _guard = remote_env_lock().lock().unwrap();
-        // Worst case for the readable form: macOS-style 49-char TMPDIR +
-        // max-length sanitized components. Should fall back to the hashed
-        // short name, which fits under TMPDIR.
+        // Worst case for the readable form: max-length sanitized components.
+        // The hashed short name keeps the path inside the private directory.
         let target = "longish-host.example.com";
         let session = "a-fairly-long-session-name-here";
-        let path = local_forward_socket_path(target, session);
+        let path = local_forward_socket_path(target, session).expect("socket path");
         assert!(
             fits_unix_socket_path(&path),
             "socket path too long for sun_path: {} ({} bytes)",
@@ -6287,36 +6314,41 @@ function Get-Process {
 
     #[cfg(unix)]
     #[test]
-    fn local_forward_socket_path_falls_back_to_tmp_when_dir_is_long() {
+    fn local_forward_socket_path_falls_back_to_a_private_short_directory() {
         let _guard = remote_env_lock().lock().unwrap();
-        // Force a TMPDIR long enough that even the hashed short name cannot
-        // fit inside it. The fallback should drop to /tmp.
-        let prior = std::env::var_os("TMPDIR");
-        let long_dir = std::env::temp_dir().join("a".repeat(80));
+        // Force a state directory long enough that neither name fits. The
+        // fallback must still be private to this user, never /tmp itself.
+        let prior = std::env::var_os("XDG_STATE_HOME");
+        let long_dir = std::env::temp_dir().join("a".repeat(120));
         let _ = fs::create_dir_all(&long_dir);
-        std::env::set_var("TMPDIR", &long_dir);
+        std::env::set_var("XDG_STATE_HOME", &long_dir);
 
         let path = local_forward_socket_path("longish-host.example.com", "default");
-        let fits = fits_unix_socket_path(&path);
-        let parent = path.parent().map(Path::to_path_buf);
-        let filename = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
 
         match prior {
-            Some(v) => std::env::set_var("TMPDIR", v),
-            None => std::env::remove_var("TMPDIR"),
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
         }
         let _ = fs::remove_dir_all(&long_dir);
 
-        assert!(fits, "fallback path still overflows: {}", path.display());
-        assert_eq!(parent.as_deref(), Some(Path::new("/tmp")));
+        let path = path.expect("the fallback finds room for a socket");
         assert!(
-            filename.starts_with("herdr-r-"),
-            "expected hashed fallback, got {filename}"
+            fits_unix_socket_path(&path),
+            "fallback path still overflows sun_path: {} ({} bytes)",
+            path.display(),
+            socket_path_byte_len(&path)
         );
+        let parent = path.parent().expect("socket has a parent");
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(parent).expect("fallback directory exists");
+        assert_eq!(
+            metadata.mode() & 0o077,
+            0,
+            "the fallback directory must not be reachable by other users: {} ({:04o})",
+            parent.display(),
+            metadata.mode() & 0o777
+        );
+        assert_eq!(metadata.uid(), unsafe { libc::getuid() });
     }
 
     #[test]

@@ -119,6 +119,12 @@ pub(crate) struct AuthorizedDevice {
     pub(crate) certificate_sha256: String,
     #[serde(default)]
     pub(crate) enrolled_unix_seconds: u64,
+    /// Sessions this device was enrolled for. Empty means "never enrolled for a
+    /// session", which authorizes nothing: an entry written before scoping
+    /// existed must re-enroll over SSH instead of silently gaining access to
+    /// every session on the host.
+    #[serde(default)]
+    pub(crate) sessions: Vec<String>,
     /// A revoked entry stays behind as a tombstone so the next SSH bootstrap
     /// cannot silently re-authorize the same certificate.
     #[serde(default)]
@@ -157,28 +163,62 @@ impl DeviceList {
         Ok(Self { devices })
     }
 
-    pub(crate) fn contains(&self, certificate: &[u8]) -> bool {
+    /// The QUIC authorization path: the certificate must be enrolled, not
+    /// revoked, and enrolled for the session this server owns.
+    ///
+    /// Returns the entry so the caller can name the device it just admitted in
+    /// the authentication log.
+    pub(crate) fn authorize(
+        &self,
+        certificate: &[u8],
+        session: &str,
+    ) -> Option<&AuthorizedDevice> {
         let digest = hex_encode(&hash(certificate));
-        self.devices.iter().any(|device| {
-            !device.revoked && device.certificate_sha256.eq_ignore_ascii_case(&digest)
+        self.devices.iter().find(|device| {
+            !device.revoked
+                && device.certificate_sha256.eq_ignore_ascii_case(&digest)
+                && device.sessions.iter().any(|allowed| allowed == session)
         })
     }
 
-    fn is_revoked(&self, certificate: &[u8]) -> bool {
+    /// The enrolled name for a certificate, ignoring revocation and session
+    /// scope. Lets a refused connection be attributed to a device the operator
+    /// recognizes, which is what makes "a revoked device is still trying" a
+    /// readable event instead of an anonymous refusal.
+    pub(crate) fn enrolled_name(&self, certificate: &[u8]) -> Option<&str> {
         let digest = hex_encode(&hash(certificate));
         self.devices
             .iter()
-            .any(|device| device.revoked && device.certificate_sha256.eq_ignore_ascii_case(&digest))
+            .find(|device| device.certificate_sha256.eq_ignore_ascii_case(&digest))
+            .map(|device| device.name.as_str())
     }
 
-    pub(crate) fn add(&mut self, name: &str, certificate: &[u8], now_unix_seconds: u64) -> bool {
-        if self.is_revoked(certificate) || self.contains(certificate) {
-            return false;
+    pub(crate) fn add(
+        &mut self,
+        name: &str,
+        certificate: &[u8],
+        session: &str,
+        now_unix_seconds: u64,
+    ) -> bool {
+        let digest = hex_encode(&hash(certificate));
+        if let Some(existing) = self
+            .devices
+            .iter_mut()
+            .find(|device| device.certificate_sha256.eq_ignore_ascii_case(&digest))
+        {
+            // A tombstone stays a tombstone; otherwise the same device
+            // enrolling for a second session only widens its own entry.
+            if existing.revoked || existing.sessions.iter().any(|allowed| allowed == session) {
+                return false;
+            }
+            existing.sessions.push(session.to_owned());
+            return true;
         }
         self.devices.push(AuthorizedDevice {
             name: name.to_owned(),
-            certificate_sha256: hex_encode(&hash(certificate)),
+            certificate_sha256: digest,
             enrolled_unix_seconds: now_unix_seconds,
+            sessions: vec![session.to_owned()],
             revoked: false,
         });
         true
@@ -249,10 +289,36 @@ pub(crate) fn devices_path() -> PathBuf {
     crate::config::state_dir().join(DEVICES_FILE)
 }
 
+/// Upper bound on a stored device name. Names are written to the devices file,
+/// printed by `herdr device list`, and recorded in authentication logs.
+const MAX_DEVICE_NAME_BYTES: usize = 64;
+
+/// Keeps a device name to printable text of bounded length.
+///
+/// The name comes from the enrolling machine's environment or hostname, and it
+/// ends up in a terminal and in log output. A control character in it would be
+/// interpreted where it is displayed, so it is stripped here rather than at each
+/// display site.
+pub(crate) fn sanitize_device_name(name: &str) -> String {
+    let mut cleaned = String::new();
+    for ch in name.chars().filter(|ch| !ch.is_control()) {
+        if cleaned.len() + ch.len_utf8() > MAX_DEVICE_NAME_BYTES {
+            break;
+        }
+        cleaned.push(ch);
+    }
+    if cleaned.trim().is_empty() {
+        "unknown-device".to_owned()
+    } else {
+        cleaned
+    }
+}
+
 /// Records the certificate the SSH-authenticated bootstrap presented. The
 /// read-modify-write holds the list's lock, so a concurrent revoke is not lost.
-pub(crate) fn enroll(certificate: &[u8], name: &str) -> io::Result<bool> {
-    update_devices(|devices| devices.add(name, certificate, unix_seconds()))
+pub(crate) fn enroll(certificate: &[u8], name: &str, session: &str) -> io::Result<bool> {
+    let name = sanitize_device_name(name);
+    update_devices(|devices| devices.add(&name, certificate, session, unix_seconds()))
 }
 
 /// Marks a device revoked and keeps its tombstone so the same certificate
@@ -308,10 +374,12 @@ impl DeviceCertVerifier {
 }
 
 impl rustls::server::danger::ClientCertVerifier for DeviceCertVerifier {
-    /// Offer, never require: a client that predates device enrollment still
-    /// authenticates with the capability token it obtained over SSH.
+    /// Require the certificate: it is the only authenticator the QUIC path
+    /// accepts, so a peer without one has nothing to authenticate with.
+    /// Refusing at the handshake also keeps an unauthenticated peer from
+    /// completing a hello.
     fn client_auth_mandatory(&self) -> bool {
-        false
+        true
     }
 
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
@@ -325,9 +393,9 @@ impl rustls::server::danger::ClientCertVerifier for DeviceCertVerifier {
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         // Acceptance here only proves the peer holds the key it presented. It
-        // does not authorize the device: that check needs the hello's token and
-        // runs per connection, where an unknown certificate is refused without
-        // failing the handshake a legacy token client might still need.
+        // does not authorize the device: that check is the allowlist, read per
+        // connection in `validate_and_fence`, so a revoked device is refused
+        // without failing the TLS handshake first.
         Ok(rustls::server::danger::ClientCertVerified::assertion())
     }
 
@@ -385,21 +453,58 @@ mod tests {
     #[test]
     fn enrollment_is_idempotent_and_authorizes_only_that_certificate() {
         let mut devices = device_list();
-        assert!(devices.add("laptop", b"cert-a", 10));
-        assert!(!devices.add("laptop", b"cert-a", 11));
-        assert!(devices.contains(b"cert-a"));
-        assert!(!devices.contains(b"cert-b"));
+        assert!(devices.add("laptop", b"cert-a", "default", 10));
+        assert!(!devices.add("laptop", b"cert-a", "default", 11));
+        assert_eq!(
+            devices
+                .authorize(b"cert-a", "default")
+                .map(|device| device.name.as_str()),
+            Some("laptop")
+        );
+        assert!(devices.authorize(b"cert-b", "default").is_none());
+        assert!(
+            devices.authorize(b"cert-a", "other").is_none(),
+            "an enrollment names the sessions it may attach to"
+        );
         assert_eq!(devices.devices.len(), 1);
+    }
+
+    #[test]
+    fn re_enrolling_the_same_device_adds_a_session_without_a_new_entry() {
+        let mut devices = device_list();
+        assert!(devices.add("laptop", b"cert-a", "default", 10));
+        assert!(devices.add("laptop", b"cert-a", "scratch", 20));
+        assert!(!devices.add("laptop", b"cert-a", "scratch", 30));
+        assert!(devices.authorize(b"cert-a", "default").is_some());
+        assert!(devices.authorize(b"cert-a", "scratch").is_some());
+        assert_eq!(devices.devices.len(), 1);
+    }
+
+    #[test]
+    fn an_entry_written_before_sessions_existed_authorizes_nothing() {
+        let certificate = b"legacy-cert";
+        let digest = hex_encode(&hash(certificate));
+        let entry: AuthorizedDevice = serde_json::from_str(&format!(
+            r#"{{"name":"old","certificate_sha256":"{digest}"}}"#
+        ))
+        .expect("a legacy entry still parses");
+        let devices = DeviceList {
+            devices: vec![entry],
+        };
+        assert!(
+            devices.authorize(certificate, "default").is_none(),
+            "a missing session list must fail closed, not authorize every session"
+        );
     }
 
     #[test]
     fn revocation_survives_re_enrollment() {
         let mut devices = device_list();
-        devices.add("laptop", b"cert-a", 10);
+        devices.add("laptop", b"cert-a", "default", 10);
         devices.devices[0].revoked = true;
-        assert!(!devices.contains(b"cert-a"));
+        assert!(devices.authorize(b"cert-a", "default").is_none());
         assert!(
-            !devices.add("laptop", b"cert-a", 20),
+            !devices.add("laptop", b"cert-a", "default", 20),
             "a revoked key must not re-enroll"
         );
         assert_eq!(devices.devices.len(), 1);
@@ -410,8 +515,8 @@ mod tests {
         let dir = scratch("ndjson");
         let path = dir.join("devices");
         let mut devices = device_list();
-        devices.add("laptop", b"cert-a", 10);
-        devices.add("phone", b"cert-b", 20);
+        devices.add("laptop", b"cert-a", "default", 10);
+        devices.add("phone", b"cert-b", "default", 20);
         devices.save(&path).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
@@ -420,8 +525,37 @@ mod tests {
         assert!(text.ends_with('\n'), "{text}");
         let reloaded = DeviceList::try_load(&path).unwrap();
         assert_eq!(reloaded.devices.len(), 2);
-        assert!(reloaded.contains(b"cert-a") && reloaded.contains(b"cert-b"));
+        assert!(reloaded.authorize(b"cert-a", "default").is_some());
+        assert!(reloaded.authorize(b"cert-b", "default").is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_device_is_still_named_for_the_audit_line() {
+        let mut devices = device_list();
+        devices.add("laptop", b"cert-a", "default", 10);
+        devices.devices[0].revoked = true;
+        assert!(devices.authorize(b"cert-a", "default").is_none());
+        assert_eq!(
+            devices.enrolled_name(b"cert-a"),
+            Some("laptop"),
+            "a revoked device's refusal must name it, or the log line is anonymous"
+        );
+        assert_eq!(devices.enrolled_name(b"cert-b"), None);
+    }
+
+    #[test]
+    fn a_device_name_cannot_carry_terminal_escapes() {
+        assert_eq!(
+            sanitize_device_name("laptop\x1b]52;c;aGk=\x07"),
+            "laptop]52;c;aGk="
+        );
+        assert_eq!(sanitize_device_name("a\nb"), "ab");
+        assert_eq!(sanitize_device_name("   "), "unknown-device");
+        assert_eq!(sanitize_device_name(""), "unknown-device");
+        assert_eq!(sanitize_device_name("名字").len(), "名字".len());
+        let long = "n".repeat(200);
+        assert_eq!(sanitize_device_name(&long).len(), 64);
     }
 
     #[test]
@@ -457,8 +591,12 @@ mod tests {
         std::thread::scope(|scope| {
             for index in 0..8 {
                 scope.spawn(move || {
-                    enroll(format!("cert-{index}").as_bytes(), &format!("machine-{index}"))
-                        .expect("enroll");
+                    enroll(
+                        format!("cert-{index}").as_bytes(),
+                        &format!("machine-{index}"),
+                        "default",
+                    )
+                    .expect("enroll");
                 });
             }
         });

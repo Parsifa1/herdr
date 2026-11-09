@@ -34,13 +34,16 @@ pub const MAX_CLIPBOARD_IMAGE_PAYLOAD: usize = 16 * 1024 * 1024;
 /// Schema version of the SSH-delivered QUIC bootstrap record and of the QUIC
 /// hello. Independent of `PROTOCOL_VERSION`: client and server builds may
 /// differ, and the QUIC pipe carries whatever protocol they negotiate.
+///
+/// Bumped to 3 when the connection generation left the record, the hello and
+/// the acceptance, and the bootstrap request lost the client id it never used:
+/// a peer from either side of that change must rebootstrap over SSH rather
+/// than decode the other layout.
 #[cfg(unix)]
-pub const REMOTE_QUIC_SCHEMA_VERSION: u32 = 1;
+pub const REMOTE_QUIC_SCHEMA_VERSION: u32 = 3;
 /// QUIC application protocol negotiated during the TLS handshake.
 #[cfg(unix)]
 pub const REMOTE_QUIC_ALPN: &[u8] = b"herdr/1";
-/// Capability token length in bytes.
-pub const REMOTE_QUIC_TOKEN_BYTES: usize = 32;
 /// Stable process-instance and logical-client identifier length in bytes.
 pub const REMOTE_QUIC_ID_BYTES: usize = 16;
 /// SHA-256 certificate fingerprint length in bytes.
@@ -475,18 +478,17 @@ impl ClientInputEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteBootstrapRequest {
     pub session: String,
-    pub logical_client_id: [u8; REMOTE_QUIC_ID_BYTES],
 }
 
-/// Process-lifetime QUIC authority returned over the authenticated SSH path.
+/// Process-lifetime QUIC authority returned over the authenticated SSH path:
+/// where the endpoint listens and which identity to pin. Authorization itself
+/// is the device certificate, so there is no secret here.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteBootstrapRecord {
     pub schema_version: u32,
     pub server_instance_id: [u8; REMOTE_QUIC_ID_BYTES],
     pub port: u16,
     pub certificate_fingerprint: [u8; REMOTE_QUIC_HASH_BYTES],
-    pub capability_token: [u8; REMOTE_QUIC_TOKEN_BYTES],
-    pub expires_unix_seconds: u64,
 }
 
 impl std::fmt::Debug for RemoteBootstrapRecord {
@@ -497,8 +499,6 @@ impl std::fmt::Debug for RemoteBootstrapRecord {
             .field("server_instance_id", &self.server_instance_id)
             .field("port", &self.port)
             .field("certificate_fingerprint", &self.certificate_fingerprint)
-            .field("capability_token", &"<redacted>")
-            .field("expires_unix_seconds", &self.expires_unix_seconds)
             .finish()
     }
 }
@@ -511,11 +511,10 @@ impl std::fmt::Debug for RemoteBootstrapRecord {
 pub struct RemoteQuicHello {
     pub schema_version: u32,
     pub server_instance_id: [u8; REMOTE_QUIC_ID_BYTES],
+    /// One process's claim on a client slot. Scoped to the process, never
+    /// persisted: a restarted daemon is a new client, and the server closes
+    /// whatever older connection it finds in that slot.
     pub logical_client_id: [u8; REMOTE_QUIC_ID_BYTES],
-    pub capability_token: [u8; REMOTE_QUIC_TOKEN_BYTES],
-    /// Monotonic per-credential fence; the server accepts only a generation
-    /// newer than the last one it saw for this token.
-    pub connection_generation: u64,
 }
 
 #[cfg(unix)]
@@ -526,8 +525,6 @@ impl std::fmt::Debug for RemoteQuicHello {
             .field("schema_version", &self.schema_version)
             .field("server_instance_id", &self.server_instance_id)
             .field("logical_client_id", &self.logical_client_id)
-            .field("capability_token", &"<redacted>")
-            .field("connection_generation", &self.connection_generation)
             .finish()
     }
 }
@@ -538,7 +535,6 @@ impl std::fmt::Debug for RemoteQuicHello {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteQuicAccepted {
     pub schema_version: u32,
-    pub connection_generation: u64,
 }
 
 /// Messages sent from the client to the server over the client protocol socket.

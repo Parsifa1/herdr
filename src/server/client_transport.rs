@@ -551,7 +551,7 @@ pub(crate) enum ServerEvent {
     /// A client writer drained its render slot and can accept another render.
     ClientWriterDrained { client_id: u64 },
     /// An authenticated local helper (`remote-quic-bootstrap` over SSH)
-    /// requested a process-lifetime QUIC capability.
+    /// requested the QUIC endpoint's listening details.
     RemoteBootstrap {
         request: crate::protocol::RemoteBootstrapRequest,
         respond_to: std::sync::mpsc::Sender<Result<crate::protocol::RemoteBootstrapRecord, String>>,

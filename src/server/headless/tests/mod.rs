@@ -354,7 +354,6 @@ fn remote_bootstrap_is_refused_while_transport_is_ssh() {
     assert!(!server.handle_server_event(ServerEvent::RemoteBootstrap {
         request: crate::protocol::RemoteBootstrapRequest {
             session: "default".to_owned(),
-            logical_client_id: [7; crate::protocol::REMOTE_QUIC_ID_BYTES],
         },
         respond_to,
     }));
