@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -1352,14 +1352,24 @@ fn resolve_ssh_endpoint(config: &QuicBridgeConfig) -> io::Result<(String, u16)> 
 }
 
 fn remote_quic_candidates(hostname: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    // A single-label name makes macOS resolve through mDNS first and only fall
+    // back to DNS/hosts after a multi-second multicast wait. The absolute form
+    // skips that path, so try it first and keep the bare name for hosts that
+    // only exist behind a DNS search domain.
+    let absolute = !hostname.contains('.') && hostname.parse::<IpAddr>().is_err();
+    let mut candidates = if absolute {
+        match resolve_host(&format!("{hostname}."), port) {
+            Ok(candidates) if !candidates.is_empty() => candidates,
+            _ => resolve_host(hostname, port)?,
+        }
+    } else {
+        resolve_host(hostname, port)?
+    };
     let mut seen = HashSet::new();
     // IPv6 first, then IPv4: the dial set is staggered in this order, so this
     // is the preference order for a tie. Duplicates are dropped outright
     // because a repeated address would waste a parallel dial.
-    let mut candidates = (hostname, port)
-        .to_socket_addrs()?
-        .filter(|candidate| seen.insert(*candidate))
-        .collect::<Vec<_>>();
+    candidates.retain(|candidate| seen.insert(*candidate));
     candidates.sort_by_key(|candidate| if candidate.is_ipv6() { 0 } else { 1 });
     if candidates.is_empty() {
         return Err(io::Error::new(
@@ -1368,6 +1378,10 @@ fn remote_quic_candidates(hostname: &str, port: u16) -> io::Result<Vec<SocketAdd
         ));
     }
     Ok(candidates)
+}
+
+fn resolve_host(hostname: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    Ok((hostname, port).to_socket_addrs()?.collect())
 }
 
 #[cfg(test)]
@@ -2142,6 +2156,13 @@ mod tests {
             Some(TRANSPORT_STATE_RECOVERING)
         );
         assert_eq!(transport_state_name(PathState::Lost), None);
+    }
+
+    #[test]
+    fn single_label_hostnames_still_resolve() {
+        let candidates = remote_quic_candidates("localhost", 48_001).expect("resolve localhost");
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().all(|candidate| candidate.ip().is_loopback()));
     }
 
     #[test]
