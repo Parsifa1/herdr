@@ -60,14 +60,9 @@ jobs:
           printf '%s' "$CODESIGN_P12_B64" | base64 --decode > "$d/identity.p12"
           printf '%s' "$CODESIGN_P12_PASSWORD" > "$d/password"
           chmod 0644 "$d/identity.p12" "$d/password"
-          {
-            echo "HERDR_CODESIGN_P12=$d/identity.p12"
-            echo "HERDR_CODESIGN_P12_PASSWORD_FILE=$d/password"
-            echo "HERDR_CODESIGN_KEY_ID=$(shasum -a 256 "$d/identity.p12" | cut -d' ' -f1)"
-          } >> "$GITHUB_ENV"
 
       - name: Build Herdr
-        run: nix build .#herdr --print-build-logs --impure
+        run: nix build .#herdr --print-build-logs
 
       - name: Verify signature
         if: matrix.name == 'darwin' && env.CODESIGN_P12_B64 != ''

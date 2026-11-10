@@ -8,10 +8,10 @@
   zstd,
   pkg-config,
   git,
-  coreutils,
   cctools ? null,
   xcbuild ? null,
   rcodesign ? null,
+  enableCodesign ? true,
   commitHash ? null,
 }:
 
@@ -33,22 +33,18 @@ let
     cctools
     xcbuild
   ];
-  # Codesigning identity is supplied out-of-band by CI so macOS TCC grants
-  # survive rebuilds: a real certificate keeps the designated requirement
-  # stable, while an ad-hoc signature pins it to the cdhash, which changes on
-  # every build. These are plain filesystem paths, so no key material ever
-  # enters the store. Absent for local builds, which stay ad-hoc signed.
-  codesignP12 = builtins.getEnv "HERDR_CODESIGN_P12";
-  codesignPasswordFile = builtins.getEnv "HERDR_CODESIGN_P12_PASSWORD_FILE";
-  # Nix cannot see file contents behind those paths, so without this the
-  # derivation would keep its hash when the certificate is rotated and a cache
-  # hit would serve the previous signature.
-  codesignKeyId = builtins.getEnv "HERDR_CODESIGN_KEY_ID";
-  withSignature =
-    stdenv.hostPlatform.isDarwin
-    && codesignP12 != ""
-    && codesignPasswordFile != ""
-    && codesignKeyId != "";
+  # The signing identity is pinned here rather than read from the environment:
+  # an environment read needs impure evaluation, which consumers cannot use.
+  # Pinning also means a local pure evaluation derives the same output path as
+  # CI, so the signed artifact is substituted instead of rebuilt. No key
+  # material reaches the store; only this path string and the certificate hash.
+  codesignP12 = "/tmp/herdr-codesign/identity.p12";
+  codesignPasswordFile = "/tmp/herdr-codesign/password";
+  # SHA-1 of the certificate, identical to the "certificate root = H"…"" value
+  # macOS records in the designated requirement. Changing the certificate must
+  # change this constant so the derivation cannot hit a stale signed output.
+  codesignCertSha1 = "14d58e07e52f264376d7f38139ad59e9d2fe6ddf";
+  withSignature = stdenv.hostPlatform.isDarwin && enableCodesign;
 in
 rustPlatform.buildRustPackage {
   pname = "herdr";
@@ -90,7 +86,7 @@ rustPlatform.buildRustPackage {
     ZIG = lib.getExe zig_0_16;
     HERDR_BUILD_COMMIT = lib.optionalString (commitHash != null) commitHash;
   } // lib.optionalAttrs withSignature {
-    inherit codesignKeyId;
+    inherit codesignCertSha1;
   };
 
   preBuild = ''
@@ -108,12 +104,10 @@ rustPlatform.buildRustPackage {
   # (unreachable for a self-signed cert, and non-deterministic anyway).
   postFixup = lib.optionalString withSignature ''
     set -e
-    raw=$(${lib.getExe' coreutils "sha256sum"} ${lib.escapeShellArg codesignP12})
-    actual=''${raw%% *}
-    if [ "$actual" != "$codesignKeyId" ]; then
-      echo "codesigning identity is not the one this derivation was evaluated for" >&2
-      echo "  expected: $codesignKeyId" >&2
-      echo "  actual:   $actual" >&2
+    if [ ! -r ${lib.escapeShellArg codesignP12} ]; then
+      echo "codesigning identity missing: ${codesignP12}" >&2
+      echo "this package is pinned to certificate ${codesignCertSha1};" >&2
+      echo "provide that key or build with enableCodesign = false" >&2
       exit 1
     fi
     rcodesign sign \
@@ -124,6 +118,15 @@ rustPlatform.buildRustPackage {
       "$out/bin/herdr" "$out/bin/herdr.signed"
     mv "$out/bin/herdr.signed" "$out/bin/herdr"
     chmod 555 "$out/bin/herdr"
+    dr=$(/usr/bin/codesign -d -r- "$out/bin/herdr" 2>&1)
+    case "$dr" in
+      *"certificate root = H\"$codesignCertSha1\""*) ;;
+      *)
+        echo "signed with an unexpected certificate:" >&2
+        echo "$dr" >&2
+        exit 1
+        ;;
+    esac
   '';
 
   meta = {
