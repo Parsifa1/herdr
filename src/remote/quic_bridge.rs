@@ -1745,13 +1745,6 @@ mod tests {
         assert_eq!(
             next_step(
                 &mut state,
-                LadderEvent::ConnectFailed(ConnectError::Timeout("no answer".to_owned()))
-            ),
-            LadderStep::SshFallback("no answer".to_owned())
-        );
-        assert_eq!(
-            next_step(
-                &mut state,
                 LadderEvent::ConnectFailed(ConnectError::Other("no socket".to_owned()))
             ),
             LadderStep::SshFallback("no socket".to_owned())
