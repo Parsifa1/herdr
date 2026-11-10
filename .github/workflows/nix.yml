@@ -26,6 +26,9 @@ jobs:
           - name: darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
+    env:
+      CODESIGN_P12_B64: ${{ secrets.HERDR_CODESIGN_P12_B64 }}
+      CODESIGN_P12_PASSWORD: ${{ secrets.HERDR_CODESIGN_P12_PASSWORD }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -46,8 +49,45 @@ jobs:
           signingKey: ${{ secrets.CACHIX_SIGNING_KEY }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
+      - name: Materialize codesigning identity
+        if: matrix.name == 'darwin' && env.CODESIGN_P12_B64 != ''
+        run: |
+          set -euo pipefail
+          d=/tmp/herdr-codesign
+          # World-readable on purpose: with a multi-user Nix install the
+          # builder runs as an _nixbld* user, not as the runner.
+          install -d -m 0755 "$d"
+          printf '%s' "$CODESIGN_P12_B64" | base64 --decode > "$d/identity.p12"
+          printf '%s' "$CODESIGN_P12_PASSWORD" > "$d/password"
+          chmod 0644 "$d/identity.p12" "$d/password"
+          {
+            echo "HERDR_CODESIGN_P12=$d/identity.p12"
+            echo "HERDR_CODESIGN_P12_PASSWORD_FILE=$d/password"
+            echo "HERDR_CODESIGN_KEY_ID=$(shasum -a 256 "$d/identity.p12" | cut -d' ' -f1)"
+          } >> "$GITHUB_ENV"
+
       - name: Build Herdr
-        run: nix build .#herdr --print-build-logs
+        run: nix build .#herdr --print-build-logs --impure
+
+      - name: Verify signature
+        if: matrix.name == 'darwin' && env.CODESIGN_P12_B64 != ''
+        run: |
+          set -euo pipefail
+          bin=$(readlink -f result/bin/herdr)
+          echo "binary: $bin"
+          info=$(codesign -dvvv "$bin" 2>&1)
+          echo "$info"
+          req=$(codesign -d -r- "$bin" 2>&1)
+          echo "$req"
+          codesign --verify --strict "$bin"
+          grep -q '^Authority=' <<<"$info" \
+            || { echo "not signed with a certificate" >&2; exit 1; }
+          if grep -q '^Signature=adhoc$' <<<"$info"; then
+            echo "still ad-hoc signed" >&2; exit 1
+          fi
+          grep -q 'certificate' <<<"$req" \
+            || { echo "designated requirement is not certificate-anchored; TCC grants would not survive upgrades" >&2; exit 1; }
+          "$bin" --version
 
   test:
     name: test
