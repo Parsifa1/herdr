@@ -49,6 +49,9 @@ pub struct Palette {
     pub surface1: Color,
     /// Very dim surface for separators.
     pub surface_dim: Color,
+    /// Split dividers and pane borders touching the focused pane; `None` falls
+    /// back to `accent`.
+    pub separator: Option<Color>,
     /// Muted text (secondary info, numbers).
     pub overlay0: Color,
     /// Slightly brighter overlay text.
@@ -85,6 +88,7 @@ impl Palette {
             surface0: Color::Rgb(49, 50, 68),
             surface1: Color::Rgb(69, 71, 90),
             surface_dim: Color::Rgb(30, 30, 46),
+            separator: None,
             overlay0: Color::Rgb(108, 112, 134),
             overlay1: Color::Rgb(127, 132, 156),
             text: Color::Rgb(205, 214, 244),
@@ -110,6 +114,7 @@ impl Palette {
             surface0: Color::Rgb(204, 208, 218),
             surface1: Color::Rgb(188, 192, 204),
             surface_dim: Color::Rgb(230, 233, 239),
+            separator: None,
             overlay0: Color::Rgb(156, 160, 176),
             overlay1: Color::Rgb(140, 143, 161),
             text: Color::Rgb(76, 79, 105),
@@ -135,6 +140,7 @@ impl Palette {
             surface0: Color::Reset,
             surface1: Color::DarkGray,
             surface_dim: Color::DarkGray,
+            separator: None,
             overlay0: Color::Gray,
             overlay1: Color::White,
             text: Color::Reset,
@@ -160,6 +166,7 @@ impl Palette {
             surface0: Color::Rgb(36, 40, 59),
             surface1: Color::Rgb(65, 72, 104),
             surface_dim: Color::Rgb(26, 27, 38),
+            separator: None,
             overlay0: Color::Rgb(86, 95, 137),
             overlay1: Color::Rgb(105, 113, 150),
             text: Color::Rgb(192, 202, 245),
@@ -185,6 +192,7 @@ impl Palette {
             surface0: Color::Rgb(196, 200, 218),
             surface1: Color::Rgb(168, 174, 203),
             surface_dim: Color::Rgb(210, 211, 218),
+            separator: None,
             overlay0: Color::Rgb(137, 144, 179),
             overlay1: Color::Rgb(104, 112, 154),
             text: Color::Rgb(55, 96, 191),
@@ -210,6 +218,7 @@ impl Palette {
             surface0: Color::Rgb(68, 71, 90),
             surface1: Color::Rgb(98, 114, 164),
             surface_dim: Color::Rgb(40, 42, 54),
+            separator: None,
             overlay0: Color::Rgb(98, 114, 164),
             overlay1: Color::Rgb(130, 140, 180),
             text: Color::Rgb(248, 248, 242),
@@ -235,6 +244,7 @@ impl Palette {
             surface0: Color::Rgb(59, 66, 82),
             surface1: Color::Rgb(67, 76, 94),
             surface_dim: Color::Rgb(46, 52, 64),
+            separator: None,
             overlay0: Color::Rgb(76, 86, 106),
             overlay1: Color::Rgb(100, 110, 130),
             text: Color::Rgb(236, 239, 244),
@@ -260,6 +270,7 @@ impl Palette {
             surface0: Color::Rgb(60, 56, 54),
             surface1: Color::Rgb(80, 73, 69),
             surface_dim: Color::Rgb(40, 40, 40),
+            separator: None,
             overlay0: Color::Rgb(146, 131, 116),
             overlay1: Color::Rgb(168, 153, 132),
             text: Color::Rgb(235, 219, 178),
@@ -285,6 +296,7 @@ impl Palette {
             surface0: Color::Rgb(235, 219, 178),
             surface1: Color::Rgb(213, 196, 161),
             surface_dim: Color::Rgb(242, 229, 188),
+            separator: None,
             overlay0: Color::Rgb(146, 131, 116),
             overlay1: Color::Rgb(124, 111, 100),
             text: Color::Rgb(60, 56, 54),
@@ -310,6 +322,7 @@ impl Palette {
             surface0: Color::Rgb(44, 49, 58),
             surface1: Color::Rgb(62, 68, 81),
             surface_dim: Color::Rgb(40, 44, 52),
+            separator: None,
             overlay0: Color::Rgb(92, 99, 112),
             overlay1: Color::Rgb(115, 122, 135),
             text: Color::Rgb(171, 178, 191),
@@ -335,6 +348,7 @@ impl Palette {
             surface0: Color::Rgb(240, 240, 241),
             surface1: Color::Rgb(229, 229, 230),
             surface_dim: Color::Rgb(245, 245, 246),
+            separator: None,
             overlay0: Color::Rgb(160, 161, 167),
             overlay1: Color::Rgb(104, 107, 119),
             text: Color::Rgb(56, 58, 66),
@@ -360,6 +374,7 @@ impl Palette {
             surface0: Color::Rgb(7, 54, 66),
             surface1: Color::Rgb(88, 110, 117),
             surface_dim: Color::Rgb(0, 43, 54),
+            separator: None,
             overlay0: Color::Rgb(88, 110, 117),
             overlay1: Color::Rgb(101, 123, 131),
             text: Color::Rgb(147, 161, 161),
@@ -385,6 +400,7 @@ impl Palette {
             surface0: Color::Rgb(238, 232, 213),
             surface1: Color::Rgb(147, 161, 161),
             surface_dim: Color::Rgb(238, 232, 213),
+            separator: None,
             overlay0: Color::Rgb(147, 161, 161),
             overlay1: Color::Rgb(88, 110, 117),
             text: Color::Rgb(101, 123, 131),
@@ -410,6 +426,7 @@ impl Palette {
             surface0: Color::Rgb(42, 42, 55),
             surface1: Color::Rgb(54, 54, 70),
             surface_dim: Color::Rgb(31, 31, 40),
+            separator: None,
             overlay0: Color::Rgb(114, 113, 105),
             overlay1: Color::Rgb(135, 134, 125),
             text: Color::Rgb(220, 215, 186),
@@ -435,6 +452,7 @@ impl Palette {
             surface0: Color::Rgb(220, 213, 172),
             surface1: Color::Rgb(201, 203, 209),
             surface_dim: Color::Rgb(213, 206, 163),
+            separator: None,
             overlay0: Color::Rgb(160, 156, 172),
             overlay1: Color::Rgb(138, 137, 128),
             text: Color::Rgb(84, 84, 100),
@@ -460,6 +478,7 @@ impl Palette {
             surface0: Color::Rgb(31, 29, 46),
             surface1: Color::Rgb(38, 35, 58),
             surface_dim: Color::Rgb(38, 35, 58),
+            separator: None,
             overlay0: Color::Rgb(110, 106, 134),
             overlay1: Color::Rgb(144, 140, 170),
             text: Color::Rgb(224, 222, 244),
@@ -485,6 +504,7 @@ impl Palette {
             surface0: Color::Rgb(242, 233, 225),
             surface1: Color::Rgb(255, 250, 243),
             surface_dim: Color::Rgb(242, 233, 225),
+            separator: None,
             overlay0: Color::Rgb(152, 147, 165),
             overlay1: Color::Rgb(121, 117, 147),
             text: Color::Rgb(70, 66, 97),
@@ -510,6 +530,7 @@ impl Palette {
             surface0: Color::Rgb(35, 35, 35),
             surface1: Color::Rgb(40, 40, 40),
             surface_dim: Color::Rgb(16, 16, 16),
+            separator: None,
             overlay0: Color::Rgb(92, 92, 92),
             overlay1: Color::Rgb(126, 126, 126),
             text: Color::Rgb(255, 255, 255),
@@ -549,6 +570,10 @@ impl Palette {
         }
     }
 
+    pub fn separator(&self) -> Color {
+        self.separator.unwrap_or(self.accent)
+    }
+
     /// Apply custom color overrides on top of this palette.
     pub fn with_overrides(mut self, custom: &crate::config::CustomThemeColors) -> Self {
         use crate::config::parse_color;
@@ -575,6 +600,9 @@ impl Palette {
         }
         if let Some(c) = &custom.surface_dim {
             self.surface_dim = parse_color(c);
+        }
+        if let Some(c) = &custom.separator {
+            self.separator = Some(parse_color(c));
         }
         if let Some(c) = &custom.overlay0 {
             self.overlay0 = parse_color(c);
@@ -637,6 +665,9 @@ impl Palette {
         }
         if let Some(c) = &custom.surface_dim {
             self.surface_dim = parse_color(c);
+        }
+        if let Some(c) = &custom.separator {
+            self.separator = Some(parse_color(c));
         }
         if let Some(c) = &custom.overlay0 {
             self.overlay0 = parse_color(c);
@@ -1466,6 +1497,22 @@ mod tests {
                 "built-in theme changed the sidebar background: {name}"
             );
         }
+    }
+
+    #[test]
+    fn separator_falls_back_to_accent_and_honors_overrides() {
+        let base = Palette::catppuccin();
+        assert_eq!(base.separator(), base.accent);
+
+        let custom: crate::config::CustomThemeColors =
+            toml::from_str("separator = \"#0a0b0c\"").unwrap();
+        let palette = Palette::catppuccin().with_overrides(&custom);
+        assert_eq!(palette.separator(), Color::Rgb(0x0a, 0x0b, 0x0c));
+
+        let mode: crate::config::ModeThemeColors =
+            toml::from_str("separator = \"#0d0e0f\"").unwrap();
+        let palette = palette.with_mode_overrides(&mode);
+        assert_eq!(palette.separator(), Color::Rgb(0x0d, 0x0e, 0x0f));
     }
 
     #[test]

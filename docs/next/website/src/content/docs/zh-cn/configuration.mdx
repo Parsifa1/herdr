@@ -286,6 +286,8 @@ yellow = "#f9e2af"
 
 颜色值支持十六进制、命名颜色、`rgb(r,g,b)`，以及 `reset`、`default`、`none`、`transparent` 等重置别名。
 
+`separator` 设置接触焦点 pane 的分屏分隔线与 pane 边框线的颜色，省略时回退到 `accent`。不接触焦点 pane 的线恒为 `surface_dim`（与其他 UI 分隔线同色），不可配置。
+
 启用 `auto_switch` 后，可以通过明暗模式子表在共享自定义颜色之上应用不同的覆盖值：
 
 ```toml

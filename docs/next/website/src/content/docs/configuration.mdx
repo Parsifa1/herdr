@@ -290,6 +290,8 @@ yellow = "#f9e2af"
 
 Color values accept hex, named colors, `rgb(r,g,b)`, or reset aliases like `reset`, `default`, `none`, and `transparent`.
 
+`separator` sets the color of split dividers and pane border lines that touch the focused pane; it falls back to `accent`. Lines that do not touch the focused pane are always `surface_dim`, the same color other UI separators use, and are not configurable.
+
 When `auto_switch` is enabled, optional light and dark subtables layer on top of the shared custom colors:
 
 ```toml
