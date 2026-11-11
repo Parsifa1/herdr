@@ -597,9 +597,9 @@ fn render_pane_borders(
         let cell = &mut buf[(x, y)];
         cell.set_symbol(symbol);
         let color = if focused {
-            app.palette.accent
+            app.palette.separator()
         } else {
-            app.palette.overlay0
+            app.palette.surface_dim
         };
         cell.set_style(Style::default().fg(color));
     }
@@ -764,9 +764,9 @@ fn render_pane_border_titles(
             continue;
         }
         let color = if info.is_focused {
-            app.palette.accent
+            app.palette.separator()
         } else {
-            app.palette.overlay0
+            app.palette.surface_dim
         };
         let mut style = Style::default().fg(color);
         if info.is_focused {
@@ -1202,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn global_pane_border_renderer_composes_junctions_and_focus_style() {
+    fn global_pane_border_renderer_composes_junctions() {
         let mut app = AppState::test_new();
         app.view.terminal_area = Rect::new(0, 0, 4, 4);
         app.view.pane_infos = vec![
@@ -1265,13 +1265,14 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(2, 2)].symbol(), "┼");
-        assert_eq!(buffer[(2, 2)].style().fg, Some(app.palette.accent));
+        assert_eq!(buffer[(2, 2)].style().fg, Some(app.palette.separator()));
         assert_eq!(buffer[(2, 1)].symbol(), "│");
-        assert_eq!(buffer[(2, 1)].style().fg, Some(app.palette.accent));
+        assert_eq!(buffer[(2, 1)].style().fg, Some(app.palette.separator()));
+        assert_eq!(app.palette.separator(), app.palette.accent);
     }
 
     #[test]
-    fn gapped_pane_focus_does_not_color_neighbor_border() {
+    fn focused_pane_borders_use_the_separator_token_and_unfocused_stay_dim() {
         let mut app = AppState::test_new();
         app.pane_gaps = true;
         app.view.terminal_area = Rect::new(0, 0, 4, 3);
@@ -1297,13 +1298,14 @@ mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(4, 3)).unwrap();
 
+        app.palette.separator = Some(Color::Rgb(9, 9, 9));
         terminal
             .draw(|frame| render_view_pane_borders(&app, &ws, &[], frame))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(1, 1)].style().fg, Some(app.palette.accent));
-        assert_eq!(buffer[(2, 1)].style().fg, Some(app.palette.overlay0));
+        assert_eq!(buffer[(1, 1)].style().fg, Some(Color::Rgb(9, 9, 9)));
+        assert_eq!(buffer[(2, 1)].style().fg, Some(app.palette.surface_dim));
     }
 
     #[tokio::test]
