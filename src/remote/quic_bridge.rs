@@ -1354,9 +1354,11 @@ fn resolve_ssh_endpoint(config: &QuicBridgeConfig) -> io::Result<(String, u16)> 
 fn remote_quic_candidates(hostname: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     // A single-label name makes macOS resolve through mDNS first and only fall
     // back to DNS/hosts after a multi-second multicast wait. The absolute form
-    // skips that path, so try it first and keep the bare name for hosts that
-    // only exist behind a DNS search domain.
-    let absolute = !hostname.contains('.') && hostname.parse::<IpAddr>().is_err();
+    // skips that path. Elsewhere the absolute form resolves through DNS only,
+    // where a search-domain or proxy answer can differ from /etc/hosts.
+    let absolute = cfg!(target_os = "macos")
+        && !hostname.contains('.')
+        && hostname.parse::<IpAddr>().is_err();
     let mut candidates = if absolute {
         match resolve_host(&format!("{hostname}."), port) {
             Ok(candidates) if !candidates.is_empty() => candidates,
